@@ -120,42 +120,6 @@
     return out;
   }
 
-  // ------------------------------------------------------------------- auth --
-  // Personal API tokens (pk_...) are sent as-is. OAuth access tokens use the
-  // documented "Bearer" form unless the worker found that ClickUp only accepts
-  // the bare token for it (scheme === 'plain').
-
-  function authHeader(token, scheme) {
-    var t = String(token || '').trim();
-    if (!t) return '';
-    if (/^pk_/i.test(t) || scheme === 'plain') return t;
-    return 'Bearer ' + t;
-  }
-
-  // Parse the query string ClickUp redirects back with after "Log in with
-  // ClickUp": returns { code, state } or null when there is no code.
-  function parseOAuthCallback(search) {
-    var s = String(search || '');
-    if (s.charAt(0) === '?') s = s.slice(1);
-    var out = {};
-    s.split('&').forEach(function (pair) {
-      if (!pair) return;
-      var i = pair.indexOf('=');
-      var k = decodeURIComponent(i === -1 ? pair : pair.slice(0, i));
-      var v = i === -1 ? '' : decodeURIComponent(pair.slice(i + 1).replace(/\+/g, ' '));
-      out[k] = v;
-    });
-    if (!out.code) return null;
-    return { code: out.code, state: out.state || '' };
-  }
-
-  // Redirect URI used for OAuth: the page URL without query/hash and without
-  // a trailing index.html, so it matches the URL registered in the ClickUp app.
-  function oauthRedirectUri(origin, pathname) {
-    var p = String(pathname || '/').replace(/index\.html?$/i, '');
-    return String(origin || '') + p;
-  }
-
   // ------------------------------------------------------------------ hours --
 
   function msToHours(ms) {
@@ -313,9 +277,6 @@
     parsePlanning: parsePlanning,
     formatPlanning: formatPlanning,
     prunePlanning: prunePlanning,
-    authHeader: authHeader,
-    parseOAuthCallback: parseOAuthCallback,
-    oauthRedirectUri: oauthRedirectUri,
     roundHours: roundHours,
     msToHours: msToHours,
     hoursToMs: hoursToMs,

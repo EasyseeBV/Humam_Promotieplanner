@@ -1,38 +1,28 @@
 /*
- * app.js — ClickUp Planner (browser side).
+ * app.js — Humam Promotieplanner (browser side).
  *
- * Talks directly to the ClickUp v2 API from the browser (the API sends CORS
- * headers), using the visitor's own personal API token stored in
- * localStorage. Planning is stored per task in a text custom field so it is
- * shared with everyone who opens the page and visible inside ClickUp.
+ * No login: the page talks to a small Cloudflare Worker (see worker/) that
+ * relays read-only ClickUp calls for the Promotions list with a token that
+ * only the worker knows, and that stores the weekly plan in its own database.
+ * Nothing about the plan is written to ClickUp.
  */
 (function () {
   'use strict';
 
   var C = window.PlannerCore;
-  var API = 'https://api.clickup.com/api/v2';
-  var LS_TOKEN = 'clickupPlanner.token';
-  var LS_TOKEN_SCHEME = 'clickupPlanner.tokenScheme'; // 'bearer' | 'plain', for OAuth tokens
   var LS_SETTINGS = 'clickupPlanner.settings';
   var LS_COLLAPSED = 'clickupPlanner.collapsed';
 
   var DEFAULT_SETTINGS = {
     listId: '901523821635',        // ClickUp list "Promotions"
-    planningFieldName: 'Planning', // text custom field on that list
+    workerUrl: 'https://humam-promotieplanner-auth.humam-promotieplanner-auth.workers.dev',
     workdays: [1, 2, 3],           // Mon, Tue, Wed  (1=Mon .. 7=Sun)
     normScope: 'day',              // 'day' or 'week'
     hoursPerUnit: 7.5,             // capacity per day (or per week)
     minHoursPerUnit: 7,            // must be planned per day (or per week)
     refreshSeconds: 60,            // auto refresh interval
-    keepWeeks: 8,                  // planning older than this is pruned on save
-    // "Log in with ClickUp" (OAuth). The client id is public. Exchanging the
-    // login code for a token needs the client secret, so that step runs in a
-    // tiny Cloudflare Worker (see worker/). Leave the URL empty to offer
-    // personal-token login only.
-    oauthClientId: '277AWTMT2UOVUFVED8DPY21W4HT4JQR5',
-    oauthExchangeUrl: 'https://humam-promotieplanner-auth.humam-promotieplanner-auth.workers.dev'
+    keepWeeks: 8                   // planning older than this is pruned on save
   };
-  var LS_OAUTH_STATE = 'clickupPlanner.oauthState';
 
   var DAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   var DAY_LONG = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -41,27 +31,20 @@
   // ------------------------------------------------------------------ state --
 
   var state = {
-    token: localStorage.getItem(LS_TOKEN) || '',
-    tokenScheme: localStorage.getItem(LS_TOKEN_SCHEME) || 'bearer',
-    retryAfterVerify: false,
-    user: null,
     settings: loadSettings(),
     listName: '',
     tasks: [],
-    fieldId: null,
-    fieldChecked: false,
+    plan: {},               // taskId -> { 'YYYY-MM-DD': hours }, as stored by the worker
     weekMonday: C.startOfWeek(new Date()),
     loading: false,
     error: null,
     lastUpdated: null,
-    editing: null,          // { taskId, date, hours, isNew }
-    estimateEditing: null,  // taskId
+    editing: null,          // { taskId, date, origDate, hours, isNew }
     filter: '',
     showDone: false,
     collapsed: loadCollapsed(),
     saving: {},
-    dragTaskId: null,
-    oauthBusy: false        // true while the ClickUp login code is being exchanged
+    dragTaskId: null
   };
 
   var refreshTimer = null;
@@ -72,8 +55,7 @@
     try { s = JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}') || {}; } catch (e) { s = {}; }
     var out = {};
     Object.keys(DEFAULT_SETTINGS).forEach(function (k) {
-      out[k] = s[k] !== undefined && s[k] !== null ? s[k] : DEFAULT_SETTINGS[k];
-      if (out[k] === '' && DEFAULT_SETTINGS[k] !== '') out[k] = DEFAULT_SETTINGS[k];
+      out[k] = s[k] !== undefined && s[k] !== null && s[k] !== '' ? s[k] : DEFAULT_SETTINGS[k];
     });
     if (!Array.isArray(out.workdays) || !out.workdays.length) out.workdays = DEFAULT_SETTINGS.workdays.slice();
     return out;
@@ -100,46 +82,40 @@
   }
   ApiError.prototype = Object.create(Error.prototype);
 
-  // Personal tokens talk to ClickUp directly (it sends CORS headers for them).
-  // OAuth tokens are relayed through the worker, because ClickUp omits CORS
-  // headers for those and the browser would refuse every response.
-  function apiBase() {
-    var direct = /^pk_/i.test(state.token) || !state.settings.oauthExchangeUrl;
-    return direct ? API : String(state.settings.oauthExchangeUrl).replace(/\/+$/, '') + '/api/v2';
+  function workerBase() {
+    return String(state.settings.workerUrl || '').replace(/\/+$/, '');
   }
 
+  // Call the worker: `path` is e.g. '/api/v2/list/…' (relayed to ClickUp) or '/plan'.
   function api(path, opts) {
     opts = opts || {};
-    var headers = { Authorization: C.authHeader(state.token, state.tokenScheme) };
+    if (!workerBase()) return Promise.reject(new ApiError('No worker URL configured (see Settings).', 0));
+    var headers = {};
     if (opts.body) headers['Content-Type'] = 'application/json';
-    return fetch(apiBase() + path, {
+    return fetch(workerBase() + path, {
       method: opts.method || 'GET',
       headers: headers,
       body: opts.body ? JSON.stringify(opts.body) : undefined,
       cache: 'no-store'
     }).then(function (res) {
-      if (res.status === 401) throw new ApiError('ClickUp rejected the API token (401). Sign in again with a valid token.', 401);
       return res.text().then(function (text) {
         var json = null;
         if (text) { try { json = JSON.parse(text); } catch (e) { json = null; } }
         if (!res.ok) {
           var msg = (json && (json.err || json.error)) || res.statusText || ('HTTP ' + res.status);
-          throw new ApiError('ClickUp API error ' + res.status + ': ' + msg, res.status);
+          throw new ApiError('Error ' + res.status + ': ' + msg, res.status);
         }
         return json;
       });
     }, function () {
-      // ClickUp sends no CORS headers on 401/403, so a rejected token also
-      // ends up here: the browser cannot read the response at all.
-      throw new ApiError('ClickUp did not answer this request (the browser could not read the response). ' +
-        'Usually the token was rejected or has no access to this list; it can also mean you are offline.', 0);
+      throw new ApiError('Could not reach the planner service (offline, or the worker is down).', 0);
     });
   }
 
   function fetchAllTasks(listId) {
     var all = [];
     function page(n) {
-      return api('/list/' + encodeURIComponent(listId) + '/task?page=' + n + '&subtasks=true&include_closed=true')
+      return api('/api/v2/list/' + encodeURIComponent(listId) + '/task?page=' + n + '&subtasks=true&include_closed=true')
         .then(function (data) {
           var tasks = (data && data.tasks) || [];
           all = all.concat(tasks);
@@ -150,23 +126,11 @@
     return page(0);
   }
 
-  function fetchPlanningField(listId, name) {
-    return api('/list/' + encodeURIComponent(listId) + '/field').then(function (data) {
-      var wanted = String(name || '').trim().toLowerCase();
-      var fields = (data && data.fields) || [];
-      var match = null;
-      fields.forEach(function (f) {
-        if (match) return;
-        var fname = String(f.name || '').trim().toLowerCase();
-        if (fname === wanted && /text/i.test(f.type || '')) match = f;
-      });
-      return match;
-    });
+  function fetchPlan() {
+    return api('/plan').then(function (data) { return (data && data.tasks) || {}; });
   }
 
-  function normalizeTask(raw, fieldId) {
-    var cf = null;
-    (raw.custom_fields || []).forEach(function (f) { if (fieldId && f.id === fieldId) cf = f; });
+  function normalizeTask(raw, plan) {
     var est = raw.time_estimate;
     return {
       id: raw.id,
@@ -178,231 +142,54 @@
       spentHours: C.msToHours(raw.time_spent || 0),
       estimateHours: est != null && Number(est) > 0 ? C.msToHours(est) : null,
       assignees: (raw.assignees || []).map(function (a) { return a.username || a.email || ''; }),
-      planning: C.parsePlanning(cf ? cf.value : '')
+      planning: Object.assign({}, plan[raw.id] || {})
     };
   }
 
   function refresh() {
-    if (!state.token || state.loading) return Promise.resolve();
+    if (state.loading) return Promise.resolve();
     state.loading = true;
     render();
     var s = state.settings;
     var jobs = [
-      fetchPlanningField(s.listId, s.planningFieldName),
       fetchAllTasks(s.listId),
-      state.listName ? Promise.resolve(null) : api('/list/' + encodeURIComponent(s.listId)),
-      state.user ? Promise.resolve(null) : api('/user')
+      fetchPlan(),
+      state.listName ? Promise.resolve(null) : api('/api/v2/list/' + encodeURIComponent(s.listId))
     ];
     return Promise.all(jobs).then(function (r) {
-      var field = r[0], rawTasks = r[1], list = r[2], user = r[3];
-      state.fieldId = field ? field.id : null;
-      state.fieldChecked = true;
-      state.tasks = rawTasks.map(function (t) { return normalizeTask(t, state.fieldId); });
+      var rawTasks = r[0], plan = r[1], list = r[2];
+      state.plan = plan;
+      state.tasks = rawTasks.map(function (t) { return normalizeTask(t, plan); });
       if (list && list.name) state.listName = list.name;
-      if (user && user.user) state.user = user.user.username || user.user.email || '';
       state.lastUpdated = new Date();
       state.error = null;
     }).catch(function (e) {
-      if (e && e.status === 401) {
-        signOut();
-        state.error = e.message;
-        return;
-      }
       state.error = (e && e.message) || String(e);
-      if (e && e.status === 0) return explainFailure();
     }).then(function () {
       state.loading = false;
-      var again = state.retryAfterVerify;
-      state.retryAfterVerify = false;
       render();
-      if (again) return refresh();
     });
-  }
-
-  // The browser cannot read ClickUp's 401/403 responses (no CORS headers), so
-  // for OAuth tokens we ask the worker what ClickUp actually thinks of it.
-  function explainFailure() {
-    if (!state.token || /^pk_/i.test(state.token) || !state.settings.oauthExchangeUrl) return Promise.resolve();
-    return verifyWithWorker(state.token).then(function (v) {
-      if (!v) return;
-      if (!v.ok) {
-        signOut();
-        state.error = 'Your ClickUp login is no longer valid (' + v.error + '). Please log in again.';
-        return;
-      }
-      if (v.scheme && v.scheme !== state.tokenScheme) {
-        // ClickUp wants the other Authorization form for this token: switch and retry once.
-        state.tokenScheme = v.scheme;
-        localStorage.setItem(LS_TOKEN_SCHEME, v.scheme);
-        state.error = null;
-        state.retryAfterVerify = true;
-        return;
-      }
-      if (v.user && v.user.username) state.user = v.user.username;
-      if (v.list && v.list.ok === false) state.error = noListAccessMessage(v);
-      else state.error = 'ClickUp accepts the login, but this request still failed. ' + state.error;
-    }).catch(function () { /* keep the generic message */ });
-  }
-
-  function verifyWithWorker(token) {
-    var url = String(state.settings.oauthExchangeUrl).replace(/\/+$/, '') + '/verify';
-    return fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: token, list_id: String(state.settings.listId) })
-    }).then(function (res) { return res.json(); });
-  }
-
-  function noListAccessMessage(v) {
-    var who = v.user && v.user.username ? 'Logged in as ' + v.user.username + ', but this' : 'This';
-    var teams = (v.teams || []).map(function (t) { return t.name; }).join(', ');
-    return who + ' ClickUp login has no access to list ' + (v.list && v.list.id ? v.list.id : state.settings.listId) +
-      ' (' + ((v.list && v.list.error) || 'not authorized') + '). ' +
-      (teams ? 'Authorized workspaces: ' + teams + '. ' : 'No workspaces were authorized. ') +
-      'Sign out, log in with ClickUp again and tick the workspace that contains the list.';
   }
 
   function savePlanning(task, newMap) {
-    if (!state.fieldId) {
-      toast('Cannot save: the "' + state.settings.planningFieldName + '" text field does not exist on this list yet.', 'error');
-      return Promise.resolve();
-    }
     var cutoff = C.toISODate(C.addDays(C.startOfWeek(new Date()), -7 * (Number(state.settings.keepWeeks) || 8)));
     var pruned = C.prunePlanning(newMap, cutoff);
-    var text = C.formatPlanning(pruned);
     var prev = task.planning;
     task.planning = pruned;
+    state.plan[task.id] = pruned;
     state.saving[task.id] = true;
     render();
-    var path = '/task/' + encodeURIComponent(task.id) + '/field/' + encodeURIComponent(state.fieldId);
-    var req = text ? api(path, { method: 'POST', body: { value: text } }) : api(path, { method: 'DELETE' });
-    return req.then(function () {
-      toast('Planning saved');
-    }).catch(function (e) {
-      task.planning = prev;
-      toast(e.message || 'Saving failed', 'error');
-    }).then(function () {
-      delete state.saving[task.id];
-      render();
-    });
-  }
-
-  function saveEstimate(task, hours) {
-    var prev = task.estimateHours;
-    task.estimateHours = hours > 0 ? C.roundHours(hours) : null;
-    state.saving[task.id] = true;
-    render();
-    return api('/task/' + encodeURIComponent(task.id), {
-      method: 'PUT',
-      body: { time_estimate: hours > 0 ? C.hoursToMs(hours) : null }
-    }).then(function () {
-      toast('Estimate saved');
-    }).catch(function (e) {
-      task.estimateHours = prev;
-      toast(e.message || 'Saving failed', 'error');
-    }).then(function () {
-      delete state.saving[task.id];
-      render();
-    });
-  }
-
-  function signOut() {
-    state.token = '';
-    state.user = null;
-    state.tasks = [];
-    state.fieldId = null;
-    state.fieldChecked = false;
-    state.lastUpdated = null;
-    state.editing = null;
-    state.estimateEditing = null;
-    state.tokenScheme = 'bearer';
-    localStorage.removeItem(LS_TOKEN);
-    localStorage.removeItem(LS_TOKEN_SCHEME);
-  }
-
-  // ------------------------------------------------------------------ oauth --
-  // Flow: startOAuth() sends the browser to ClickUp; ClickUp redirects back to
-  // this page with ?code=…&state=…; finishOAuth() posts the code to the
-  // exchange URL (Cloudflare Worker holding the client secret) and stores the
-  // returned access token exactly like a personal token.
-
-  function randomState() {
-    var arr = new Uint8Array(16);
-    window.crypto.getRandomValues(arr);
-    return Array.prototype.map.call(arr, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
-  }
-
-  function oauthConfigured() {
-    return !!(state.settings.oauthClientId && state.settings.oauthExchangeUrl);
-  }
-
-  function startOAuth() {
-    if (!oauthConfigured()) { toast('ClickUp login is not configured (see Settings).', 'error'); return; }
-    var st = randomState();
-    try { sessionStorage.setItem(LS_OAUTH_STATE, st); } catch (e) { /* ignore */ }
-    var redirect = C.oauthRedirectUri(location.origin, location.pathname);
-    location.href = 'https://app.clickup.com/api?client_id=' + encodeURIComponent(state.settings.oauthClientId) +
-      '&redirect_uri=' + encodeURIComponent(redirect) + '&state=' + encodeURIComponent(st);
-  }
-
-  function finishOAuth(cb) {
-    var expected = '';
-    try { expected = sessionStorage.getItem(LS_OAUTH_STATE) || ''; sessionStorage.removeItem(LS_OAUTH_STATE); } catch (e) { /* ignore */ }
-    // Drop ?code=… from the address bar right away so a reload does not retry a used code.
-    try { history.replaceState(null, '', location.pathname + location.hash); } catch (e) { /* ignore */ }
-    if (!state.settings.oauthExchangeUrl) {
-      state.error = 'Received a ClickUp login code, but no token exchange URL is configured.';
-      render();
-      return Promise.resolve();
-    }
-    if (expected && cb.state !== expected) {
-      state.error = 'ClickUp login could not be verified (state mismatch). Please try again.';
-      render();
-      return Promise.resolve();
-    }
-    state.oauthBusy = true;
-    state.error = null;
-    render();
-    return fetch(state.settings.oauthExchangeUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        code: cb.code,
-        redirect_uri: C.oauthRedirectUri(location.origin, location.pathname),
-        list_id: String(state.settings.listId)
-      })
-    }).then(function (res) {
-      return res.text().then(function (text) {
-        var json = null;
-        try { json = JSON.parse(text); } catch (e) { json = null; }
-        if (!res.ok || !json || !json.access_token) {
-          throw new Error((json && json.error) || ('token exchange failed, HTTP ' + res.status));
-        }
-        return json;
-      });
-    }, function () {
-      throw new Error('could not reach the token exchange service');
-    }).then(function (result) {
-      state.token = result.access_token;
-      state.tokenScheme = result.scheme === 'plain' ? 'plain' : 'bearer';
-      localStorage.setItem(LS_TOKEN, state.token);
-      localStorage.setItem(LS_TOKEN_SCHEME, state.tokenScheme);
-      if (result.user && result.user.username) state.user = result.user.username;
-      state.oauthBusy = false;
-      if (result.list && result.list.ok === false) {
-        // Token works, but not for this list: say so instead of failing later with an unreadable 401.
-        state.error = noListAccessMessage(result);
+    return api('/plan/' + encodeURIComponent(task.id), { method: 'PUT', body: { planning: pruned } })
+      .then(function () {
+        toast('Planning saved');
+      }).catch(function (e) {
+        task.planning = prev;
+        state.plan[task.id] = prev;
+        toast(e.message || 'Saving failed', 'error');
+      }).then(function () {
+        delete state.saving[task.id];
         render();
-        return;
-      }
-      render();
-      scheduleAutoRefresh();
-      return refresh();
-    }).catch(function (e) {
-      state.oauthBusy = false;
-      state.error = 'ClickUp login failed: ' + (e && e.message ? e.message : e);
-      render();
-    });
+      });
   }
 
   // -------------------------------------------------------------- helpers --
@@ -473,10 +260,6 @@
     return names;
   }
 
-  function stateLabel(st) {
-    return { ok: 'OK', short: 'Not enough planned', over: 'Over capacity', past: 'Past – not checked' }[st] || st;
-  }
-
   function defaultEditDate(dates) {
     var t = todayISO();
     for (var i = 0; i < dates.length; i++) if (dates[i] >= t) return dates[i];
@@ -502,12 +285,7 @@
 
   function render() {
     var root = document.getElementById('app');
-    if (!state.token || state.oauthBusy) {
-      root.innerHTML = renderTokenScreen();
-      document.title = 'ClickUp Planner';
-      return;
-    }
-    document.title = (state.listName ? state.listName + ' – ' : '') + 'ClickUp Planner';
+    document.title = (state.listName ? state.listName + ' – ' : '') + 'Planner';
     var active = document.activeElement;
     var filterFocus = active && active.id === 'task-filter' ? { start: active.selectionStart, end: active.selectionEnd } : null;
     root.innerHTML =
@@ -525,39 +303,6 @@
     }
     var hours = document.querySelector('.plan-form input[name="hours"]');
     if (hours && document.activeElement !== hours) { hours.focus(); hours.select(); }
-    var est = document.querySelector('.estimate-form input[name="hours"]');
-    if (est && document.activeElement !== est) { est.focus(); est.select(); }
-  }
-
-  function renderTokenScreen() {
-    if (state.oauthBusy) {
-      return '' +
-        '<div class="token-screen"><div class="card token-card">' +
-        '  <h1>ClickUp Planner</h1>' +
-        '  <p><span class="icon spin">&#x21bb;</span> Signing in with ClickUp…</p>' +
-        '</div></div>';
-    }
-    var oauth = oauthConfigured();
-    return '' +
-      '<div class="token-screen">' +
-      '  <div class="card token-card">' +
-      '    <h1>ClickUp Planner</h1>' +
-      '    <p>This page reads tasks straight from ClickUp and stores the weekly plan in a ' +
-      '       ClickUp custom field. Your login is kept in this browser only.</p>' +
-      (state.error ? '<div class="banner error">' + esc(state.error) + '</div>' : '') +
-      (oauth
-        ? '<button type="button" class="btn primary block" data-action="oauth-login">Log in with ClickUp</button>' +
-          '<div class="or-divider"><span>or use a personal API token</span></div>'
-        : '') +
-      '    <form class="token-form" data-form="token">' +
-      '      <label class="field"><span>Personal API token</span>' +
-      '        <input name="token" type="password" autocomplete="off" placeholder="pk_…" required></label>' +
-      '      <button type="submit" class="btn' + (oauth ? '' : ' primary') + '">Sign in with token</button>' +
-      '    </form>' +
-      '    <p class="muted small">Get a token in ClickUp: avatar → <em>Settings</em> → <em>Apps</em> → <em>API Token</em> ' +
-      '       (<a href="https://app.clickup.com/settings/apps" target="_blank" rel="noopener">app.clickup.com/settings/apps</a>).</p>' +
-      '  </div>' +
-      '</div>';
   }
 
   function renderHeader() {
@@ -565,7 +310,7 @@
       '<header class="topbar">' +
       '  <div class="brand">' +
       '    <h1>' + esc(state.listName || 'ClickUp') + ' Planner</h1>' +
-      '    <span class="sub">' + (state.user ? 'Signed in as ' + esc(state.user) : 'ClickUp planning') + '</span>' +
+      '    <span class="sub">Tasks live from ClickUp · plan stored on this site</span>' +
       '  </div>' +
       '  <div class="actions">' +
       '    <span class="muted small" id="last-updated">' +
@@ -574,7 +319,6 @@
       '    <button class="btn" data-action="refresh" title="Reload from ClickUp"' + (state.loading ? ' disabled' : '') + '>' +
       '      <span class="icon' + (state.loading ? ' spin' : '') + '">&#x21bb;</span> Refresh</button>' +
       '    <button class="btn" data-action="open-settings" title="Settings">&#x2699; Settings</button>' +
-      '    <button class="btn subtle" data-action="sign-out" title="Forget the token in this browser">Sign out</button>' +
       '  </div>' +
       '</header>';
   }
@@ -584,12 +328,6 @@
     if (state.error) {
       html += '<div class="banner error"><span>' + esc(state.error) + '</span>' +
         '<button class="btn small" data-action="refresh">Retry</button></div>';
-    }
-    if (state.fieldChecked && !state.fieldId) {
-      html += '<div class="banner warn"><span><strong>Planning cannot be saved yet.</strong> ' +
-        'The list has no text custom field named <code>' + esc(state.settings.planningFieldName) + '</code>. ' +
-        'In ClickUp open the list, click <em>+</em> at the end of the column headers → <em>Text</em>, name it <code>' +
-        esc(state.settings.planningFieldName) + '</code>, then press Refresh here.</span></div>';
     }
     return html;
   }
@@ -670,7 +408,7 @@
     html += '<div class="day-head">' +
       '<div><div class="day-name" title="' + esc(fmtDateLong(day.date)) + '">' + esc(fmtDateShort(day.date)) + (day.isToday ? ' <span class="pill">today</span>' : '') + '</div>' +
       '<div class="muted small">' + C.formatHours(day.planned) + ' / ' + C.formatHours(day.capacity) +
-      (state.settings.normScope !== 'week' && !day.past ? ' · min ' + C.formatHours(day.required) : '') + '</div></div>' +
+      (!weekScope && !day.past ? ' · min ' + C.formatHours(day.required) : '') + '</div></div>' +
       '<span class="badge">' + esc(badge) + '</span></div>';
     html += '<div class="meter small"><div class="meter-fill" style="width:' + pct + '%"></div></div>';
 
@@ -730,7 +468,7 @@
       '<div class="task-row head">' +
       '<span class="col-name">Task</span><span class="col-status">Status</span>' +
       '<span class="col-num" title="Time tracked on this task in ClickUp">Spent</span>' +
-      '<span class="col-num" title="Time estimate in ClickUp – click to edit">Estimate</span>' +
+      '<span class="col-num" title="Time estimate set on the task in ClickUp">Estimate</span>' +
       '<span class="col-num" title="Estimate minus spent">Left</span>' +
       '<span class="col-num" title="Planned in the selected week">This week</span>' +
       '<span class="col-actions"></span></div>' +
@@ -760,7 +498,7 @@
 
   function renderTaskRows() {
     if (state.loading && !state.tasks.length) return '<div class="empty">Loading tasks from ClickUp…</div>';
-    if (!state.tasks.length) return '<div class="empty">No tasks found in this list.</div>';
+    if (!state.tasks.length) return '<div class="empty">' + (state.error ? 'Tasks could not be loaded.' : 'No tasks found in this list.') + '</div>';
     var dates = currentWeekDates();
     var visible = visibleTaskIds();
     var filtering = !!state.filter.trim();
@@ -786,15 +524,9 @@
     var rollupSpent = hasKids && t.rollup.spent !== t.spentHours;
     var rollupEst = hasKids && t.rollup.estimate > 0 && t.rollup.estimate !== (t.estimateHours || 0);
     var linkTitle = 'Open in ClickUp' + (t.assignees.length ? ' · ' + t.assignees.join(', ') : '');
-
-    var estCell;
-    if (state.estimateEditing === t.id) {
-      estCell = '<form class="estimate-form" data-form="estimate" data-task-id="' + esc(t.id) + '">' +
-        '<input name="hours" type="number" step="0.25" min="0" max="999" value="' + esc(t.estimateHours != null ? t.estimateHours : '') + '" placeholder="h"></form>';
-    } else {
-      estCell = '<button type="button" class="linkish" data-action="edit-estimate" data-task-id="' + esc(t.id) + '" title="Set the time estimate in ClickUp">' +
-        (t.estimateHours != null ? C.formatHours(t.estimateHours) : '<span class="muted">set…</span>') + '</button>';
-    }
+    var estCell = t.estimateHours != null
+      ? C.formatHours(t.estimateHours)
+      : '<span class="muted" title="No time estimate on this task in ClickUp yet">—</span>';
 
     return '' +
       '<div class="task-row depth-' + Math.min(depth, 4) + (done ? ' done' : '') + (state.saving[t.id] ? ' saving' : '') + '" draggable="true" data-task-id="' + esc(t.id) + '">' +
@@ -807,7 +539,7 @@
       '  <span class="col-num">' + estCell + (rollupEst ? '<span class="rollup" title="Including subtasks">Σ ' + C.formatHours(t.rollup.estimate) + '</span>' : '') + '</span>' +
       '  <span class="col-num' + (left != null && left < 0 ? ' negative' : '') + '">' + (left != null ? C.formatHours(left) : '—') + '</span>' +
       '  <span class="col-num' + (week > 0 ? ' planned' : '') + '">' + (week > 0 ? C.formatHours(week) : '—') + '</span>' +
-      '  <span class="col-actions"><button type="button" class="btn small" data-action="plan" data-task-id="' + esc(t.id) + '"' + (state.fieldId ? '' : ' disabled title="Create the Planning field first"') + '>+ Plan</button></span>' +
+      '  <span class="col-actions"><button type="button" class="btn small" data-action="plan" data-task-id="' + esc(t.id) + '">+ Plan</button></span>' +
       '</div>';
   }
 
@@ -835,14 +567,12 @@
     var f = dlg.querySelector('form');
     var s = state.settings;
     f.listId.value = s.listId;
-    f.planningFieldName.value = s.planningFieldName;
+    f.workerUrl.value = s.workerUrl;
     f.querySelectorAll('input[name="workdays"]').forEach(function (cb) { cb.checked = s.workdays.indexOf(Number(cb.value)) !== -1; });
     f.querySelectorAll('input[name="normScope"]').forEach(function (r) { r.checked = r.value === s.normScope; });
     f.hoursPerUnit.value = s.hoursPerUnit;
     f.minHoursPerUnit.value = s.minHoursPerUnit;
     f.refreshSeconds.value = s.refreshSeconds;
-    f.oauthClientId.value = s.oauthClientId || '';
-    f.oauthExchangeUrl.value = s.oauthExchangeUrl || '';
     dlg.showModal();
   }
 
@@ -855,15 +585,13 @@
     var listChanged = form.listId.value.trim() !== state.settings.listId;
     state.settings = {
       listId: form.listId.value.trim() || DEFAULT_SETTINGS.listId,
-      planningFieldName: form.planningFieldName.value.trim() || DEFAULT_SETTINGS.planningFieldName,
+      workerUrl: form.workerUrl.value.trim() || DEFAULT_SETTINGS.workerUrl,
       workdays: workdays.sort(function (a, b) { return a - b; }),
       normScope: form.querySelector('input[name="normScope"]:checked').value,
       hoursPerUnit: hours,
       minHoursPerUnit: min,
       refreshSeconds: Math.max(15, Number(form.refreshSeconds.value) || DEFAULT_SETTINGS.refreshSeconds),
-      keepWeeks: state.settings.keepWeeks,
-      oauthClientId: form.oauthClientId.value.trim() || DEFAULT_SETTINGS.oauthClientId,
-      oauthExchangeUrl: form.oauthExchangeUrl.value.trim()
+      keepWeeks: state.settings.keepWeeks
     };
     saveSettings();
     if (listChanged) { state.listName = ''; state.tasks = []; }
@@ -875,7 +603,7 @@
 
   // ---------------------------------------------------------------- events --
 
-  function startEdit(taskId, date, existingHours) {
+  function startEdit(taskId, date) {
     var task = taskById(taskId);
     if (!task) return;
     var dates = currentWeekDates();
@@ -883,12 +611,11 @@
     var isNew = !(task.planning[date] > 0);
     state.editing = {
       taskId: taskId,
-      date: date,               // day currently selected in the form
+      date: date,                    // day currently selected in the form
       origDate: isNew ? null : date, // day the existing block came from
-      hours: existingHours != null ? existingHours : (isNew ? suggestHours(task, date) : task.planning[date]),
+      hours: isNew ? suggestHours(task, date) : task.planning[date],
       isNew: isNew
     };
-    state.estimateEditing = null;
     render();
   }
 
@@ -925,8 +652,6 @@
     switch (action) {
       case 'refresh': refresh(); break;
       case 'open-settings': openSettings(); break;
-      case 'sign-out': signOut(); state.error = null; render(); break;
-      case 'oauth-login': startOAuth(); break;
       case 'prev-week': state.weekMonday = C.addDays(state.weekMonday, -7); state.editing = null; render(); break;
       case 'next-week': state.weekMonday = C.addDays(state.weekMonday, 7); state.editing = null; render(); break;
       case 'this-week': state.weekMonday = C.startOfWeek(new Date()); state.editing = null; render(); break;
@@ -937,7 +662,6 @@
       case 'toggle':
         if (state.collapsed[taskId]) delete state.collapsed[taskId]; else state.collapsed[taskId] = true;
         saveCollapsed(); rerenderTaskRows(); break;
-      case 'edit-estimate': state.estimateEditing = taskId; state.editing = null; render(); break;
       default: break;
     }
   }
@@ -947,27 +671,8 @@
     if (!form) return;
     ev.preventDefault();
     var kind = form.getAttribute('data-form');
-    if (kind === 'token') {
-      var token = form.token.value.trim();
-      if (!token) return;
-      state.token = token;
-      localStorage.setItem(LS_TOKEN, token);
-      state.error = null;
-      render();
-      refresh();
-      scheduleAutoRefresh();
-    } else if (kind === 'plan') {
+    if (kind === 'plan') {
       submitPlanForm(form);
-    } else if (kind === 'estimate') {
-      var task = taskById(form.getAttribute('data-task-id'));
-      var val = form.hours.value.trim();
-      state.estimateEditing = null;
-      if (!task) { render(); return; }
-      if (val === '') { render(); return; }
-      var hours = Number(val);
-      if (!isFinite(hours) || hours < 0) { toast('Enter a valid number of hours.', 'error'); render(); return; }
-      if (hours === (task.estimateHours || 0)) { render(); return; }
-      saveEstimate(task, hours);
     } else if (kind === 'settings') {
       if (applySettings(form)) document.getElementById('settings-dialog').close();
     }
@@ -979,9 +684,7 @@
     else if (t.name === 'hours' && t.closest('.plan-form') && state.editing) state.editing.hours = t.value;
     else if (t.name === 'date' && t.closest('.plan-form') && state.editing) {
       // Move the inline form to the chosen day column.
-      var hours = state.editing.hours;
       state.editing.date = t.value;
-      state.editing.hours = hours;
       render();
     }
   }
@@ -991,26 +694,12 @@
   }
 
   function onKeyDown(ev) {
-    if (ev.key === 'Escape') {
-      if (state.editing || state.estimateEditing) { state.editing = null; state.estimateEditing = null; render(); }
-    }
-  }
-
-  function onFocusOut(ev) {
-    var form = ev.target.closest && ev.target.closest('.estimate-form');
-    if (form && state.estimateEditing) {
-      // Commit on blur (same as pressing Enter).
-      setTimeout(function () {
-        if (state.estimateEditing && document.activeElement !== form.hours) {
-          form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-        }
-      }, 0);
-    }
+    if (ev.key === 'Escape' && state.editing) { state.editing = null; render(); }
   }
 
   function onDragStart(ev) {
     var row = ev.target.closest('.task-row[data-task-id]');
-    if (!row || !state.fieldId) { ev.preventDefault(); return; }
+    if (!row) { ev.preventDefault(); return; }
     state.dragTaskId = row.getAttribute('data-task-id');
     ev.dataTransfer.setData('text/plain', state.dragTaskId);
     ev.dataTransfer.effectAllowed = 'copy';
@@ -1053,13 +742,13 @@
   function scheduleAutoRefresh() {
     clearInterval(refreshTimer);
     refreshTimer = setInterval(function () {
-      if (!state.token || document.hidden || state.editing || state.estimateEditing || state.loading) return;
+      if (document.hidden || state.editing || state.loading) return;
       refresh();
     }, Math.max(15, Number(state.settings.refreshSeconds) || 60) * 1000);
   }
 
   function onVisibility() {
-    if (document.hidden || !state.token || state.editing || state.estimateEditing) return;
+    if (document.hidden || state.editing) return;
     var stale = !state.lastUpdated || (Date.now() - state.lastUpdated.getTime()) > 30000;
     if (stale) refresh();
   }
@@ -1072,7 +761,6 @@
     root.addEventListener('submit', onSubmit);
     root.addEventListener('input', onInput);
     root.addEventListener('change', onChange);
-    root.addEventListener('focusout', onFocusOut);
     root.addEventListener('dragstart', onDragStart);
     root.addEventListener('dragend', onDragEnd);
     root.addEventListener('dragover', onDragOver);
@@ -1087,15 +775,9 @@
       if (ev.target.getAttribute('data-action') === 'close-settings') dlg.close();
     });
 
-    // Coming back from "Log in with ClickUp"? Exchange the code first.
-    var cb = C.parseOAuthCallback(location.search);
-    if (cb) { finishOAuth(cb); return; }
-
     render();
-    if (state.token) {
-      refresh();
-      scheduleAutoRefresh();
-    }
+    refresh();
+    scheduleAutoRefresh();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);

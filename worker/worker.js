@@ -1,32 +1,26 @@
 /*
- * Cloudflare Worker for the planner's "Log in with ClickUp".
+ * Cloudflare Worker behind the planner page.
  *
- * It exists because three things cannot be done from a public static page:
- *  1. exchanging the OAuth code for a token needs the app's client secret;
- *  2. ClickUp answers 401/403 WITHOUT CORS headers, so the browser cannot read
- *     why a token was rejected;
- *  3. ClickUp's CORS headers are only reliable for personal tokens; API calls
- *     made with an OAuth token are therefore relayed through this worker.
+ * Visitors do not log in. The worker holds one ClickUp API token (a secret,
+ * set once by the workspace owner) and uses it for READ-ONLY access to the
+ * allowed list(s). The weekly plan itself never touches ClickUp: it lives in
+ * a D1 (SQLite) database bound to this worker.
  *
  * Routes:
- *   POST /  or /exchange   { code, list_id? }  -> { access_token, scheme, user, teams, list?, cors }
- *   POST /verify           { token, list_id? } -> { ok, scheme, user, teams, list?, cors } or { ok:false, error }
- *   GET/POST/PUT/DELETE /api/v2/...            -> relayed to https://api.clickup.com/api/v2/... with the
- *                                                caller's Authorization header; response gets CORS headers.
- *
- * `scheme` says which Authorization header form ClickUp accepted for a token:
- * "bearer" ("Bearer <token>", the documented form) or "plain".
+ *   GET  /status                      -> { ok, lists, clickup, storage }
+ *   GET  /api/v2/list/{id}            -> relayed to ClickUp (allowed lists only)
+ *   GET  /api/v2/list/{id}/task?...   -> relayed to ClickUp (allowed lists only)
+ *   GET  /plan                        -> { tasks: { taskId: { "YYYY-MM-DD": hours } }, updatedAt }
+ *   PUT  /plan/{taskId}  { planning } -> { ok, planning }   (empty planning deletes the row)
  *
  * Environment:
- *   CLICKUP_CLIENT_ID      (var)    public client id of the ClickUp app
- *   CLICKUP_CLIENT_SECRET  (secret) `npx wrangler secret put CLICKUP_CLIENT_SECRET`
- *   ALLOWED_ORIGINS        (var)    comma-separated page origins allowed to call this
+ *   CLICKUP_TOKEN     (secret)  personal API token used for the read-only relay
+ *   ALLOWED_LIST_IDS  (var)     comma-separated ClickUp list ids the relay may read
+ *   ALLOWED_ORIGINS   (var)     comma-separated page origins allowed to call this worker
+ *   DB                (D1)      database with the `plan` table (see schema.sql)
  */
 
 const API_ORIGIN = 'https://api.clickup.com';
-const API = API_ORIGIN + '/api/v2';
-const TOKEN_URL = API + '/oauth/token';
-const RELAY_METHODS = ['GET', 'POST', 'PUT', 'DELETE'];
 
 function json(body, status, headers) {
   return new Response(JSON.stringify(body), {
@@ -39,78 +33,41 @@ function corsHeaders(origin, allowed) {
   const ok = allowed.length === 0 || allowed.includes(origin);
   return {
     'Access-Control-Allow-Origin': ok ? (origin || '*') : allowed[0],
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'authorization, content-type',
+    'Access-Control-Allow-Methods': 'GET, PUT, OPTIONS',
+    'Access-Control-Allow-Headers': 'content-type',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
   };
 }
 
-async function clickupGet(path, authorization, extraHeaders) {
-  let res;
-  try {
-    res = await fetch(API + path, { headers: { Authorization: authorization, ...(extraHeaders || {}) } });
-  } catch {
-    return { status: 0, ok: false, data: null, headers: null, error: 'Could not reach ClickUp' };
-  }
-  let data = null;
-  try { data = await res.json(); } catch { data = null; }
-  return { status: res.status, ok: res.ok, data, headers: res.headers, error: data?.err || data?.error || `HTTP ${res.status}` };
+function csv(value) {
+  return String(value || '').split(',').map((s) => s.trim().replace(/\/+$/, '')).filter(Boolean);
 }
 
-// Check a token against ClickUp: which header form works, who it is, which
-// workspaces it may see, whether it can read one list, and whether ClickUp
-// would let a browser at `origin` read responses for it (CORS probe).
-async function verifyToken(token, listId, origin) {
-  const attempts = [['bearer', 'Bearer ' + token], ['plain', token]];
-  let scheme = null, user = null, lastError = 'unknown error', probe = null;
-  for (const [name, value] of attempts) {
-    const r = await clickupGet('/user', value, origin ? { Origin: origin } : null);
-    if (r.ok && r.data?.user) { scheme = name; user = r.data.user; probe = r; break; }
-    lastError = r.error;
-    if (r.status === 0) break;
-  }
-  if (!scheme) return { ok: false, error: 'ClickUp rejected the token (' + lastError + ')' };
-
-  const auth = scheme === 'bearer' ? 'Bearer ' + token : token;
-  const teamsRes = await clickupGet('/team', auth);
-  const teams = (teamsRes.data?.teams || []).map((t) => ({ id: String(t.id), name: t.name }));
-  const out = {
-    ok: true,
-    scheme,
-    user: { id: user.id, username: user.username || '', email: user.email || '' },
-    teams,
-    cors: { allowOrigin: probe?.headers?.get('access-control-allow-origin') || null },
-  };
-  if (listId) {
-    const l = await clickupGet('/list/' + encodeURIComponent(listId), auth);
-    out.list = l.ok
-      ? { ok: true, id: String(listId), name: l.data?.name || '' }
-      : { ok: false, id: String(listId), status: l.status, error: l.error };
-  }
-  return out;
+// Personal tokens (pk_...) go as-is, OAuth tokens need "Bearer".
+function authValue(token) {
+  return /^pk_/i.test(token) ? token : 'Bearer ' + token;
 }
 
-function readListId(body) {
-  const v = body?.list_id;
-  return typeof v === 'string' && /^\d{1,32}$/.test(v) ? v : null;
+// ------------------------------------------------------------------ relay --
+
+// Only these read-only ClickUp calls are allowed, and only for allowed lists.
+function relayAllowed(pathname, lists) {
+  const p = pathname.replace(/^\/api\/v2/, '');
+  const m = /^\/list\/(\d+)(\/task)?$/.exec(p);
+  return !!(m && lists.includes(m[1]));
 }
 
-// Relay one API call to ClickUp, adding CORS headers to whatever comes back
-// (ClickUp itself omits them for OAuth tokens and for 401/403 answers).
-async function relay(request, url, cors) {
-  if (!RELAY_METHODS.includes(request.method)) return json({ error: 'Method not allowed' }, 405, cors);
-  const auth = request.headers.get('Authorization') || '';
-  if (!auth) return json({ err: 'Missing Authorization header' }, 401, cors);
-  const init = { method: request.method, headers: { Authorization: auth, Accept: 'application/json' } };
-  if (request.method !== 'GET') {
-    const ct = request.headers.get('Content-Type');
-    if (ct) init.headers['Content-Type'] = ct;
-    init.body = await request.text();
-  }
+async function relay(request, url, cors, env) {
+  if (request.method !== 'GET') return json({ err: 'Only GET is relayed' }, 405, cors);
+  if (!relayAllowed(url.pathname, csv(env.ALLOWED_LIST_IDS))) return json({ err: 'This ClickUp call is not allowed here' }, 403, cors);
+  if (!env.CLICKUP_TOKEN) return json({ err: 'Worker has no CLICKUP_TOKEN configured' }, 503, cors);
+
   let upstream;
   try {
-    upstream = await fetch(API_ORIGIN + url.pathname + url.search, init);
+    upstream = await fetch(API_ORIGIN + url.pathname + url.search, {
+      headers: { Authorization: authValue(env.CLICKUP_TOKEN), Accept: 'application/json' },
+    });
   } catch {
     return json({ err: 'Could not reach ClickUp' }, 502, cors);
   }
@@ -125,62 +82,100 @@ async function relay(request, url, cors) {
   });
 }
 
+// ------------------------------------------------------------------- plan --
+
+const TASK_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+// Validate a { "YYYY-MM-DD": hours } object. Returns the cleaned object
+// (zero-hour entries dropped) or null when the input is not acceptable.
+export function normalizePlanning(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+  const out = {};
+  let n = 0;
+  for (const [date, value] of Object.entries(obj)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+    const h = Number(value);
+    if (!Number.isFinite(h) || h < 0 || h > 24) return null;
+    if (h > 0) {
+      out[date] = Math.round(h * 100) / 100;
+      if (++n > 200) return null;
+    }
+  }
+  return out;
+}
+
+async function loadPlan(db) {
+  const { results } = await db.prepare('SELECT task_id, planning, updated_at FROM plan').all();
+  const tasks = {};
+  let updatedAt = 0;
+  for (const row of results || []) {
+    try {
+      const planning = normalizePlanning(JSON.parse(row.planning));
+      if (planning && Object.keys(planning).length) tasks[row.task_id] = planning;
+    } catch { /* skip a corrupt row rather than failing the whole plan */ }
+    if (row.updated_at > updatedAt) updatedAt = row.updated_at;
+  }
+  return { tasks, updatedAt };
+}
+
+async function savePlan(db, taskId, planning) {
+  if (Object.keys(planning).length === 0) {
+    await db.prepare('DELETE FROM plan WHERE task_id = ?1').bind(taskId).run();
+    return;
+  }
+  await db
+    .prepare('INSERT INTO plan (task_id, planning, updated_at) VALUES (?1, ?2, ?3) ' +
+      'ON CONFLICT(task_id) DO UPDATE SET planning = excluded.planning, updated_at = excluded.updated_at')
+    .bind(taskId, JSON.stringify(planning), Date.now())
+    .run();
+}
+
+async function handlePlan(request, url, cors, env) {
+  if (!env.DB) return json({ err: 'Worker has no D1 database bound (DB)' }, 503, cors);
+  const m = /^\/plan(?:\/([^/]+))?$/.exec(url.pathname.replace(/\/+$/, ''));
+  if (!m) return json({ err: 'Not found' }, 404, cors);
+  const taskId = m[1] ? decodeURIComponent(m[1]) : null;
+
+  if (request.method === 'GET' && !taskId) {
+    return json(await loadPlan(env.DB), 200, cors);
+  }
+  if (request.method === 'PUT' && taskId) {
+    if (!TASK_ID_RE.test(taskId)) return json({ err: 'Invalid task id' }, 400, cors);
+    let body;
+    try { body = await request.json(); } catch { return json({ err: 'Body must be JSON' }, 400, cors); }
+    const planning = normalizePlanning(body?.planning);
+    if (!planning) return json({ err: 'planning must be an object of "YYYY-MM-DD": hours (0-24)' }, 400, cors);
+    await savePlan(env.DB, taskId, planning);
+    return json({ ok: true, taskId, planning }, 200, cors);
+  }
+  return json({ err: 'Method not allowed' }, 405, cors);
+}
+
+// ------------------------------------------------------------------ entry --
+
 export default {
   async fetch(request, env) {
     const origin = request.headers.get('Origin') || '';
-    const allowed = String(env.ALLOWED_ORIGINS || '')
-      .split(',')
-      .map((s) => s.trim().replace(/\/+$/, ''))
-      .filter(Boolean);
-    const cors = corsHeaders(origin, allowed);
+    const allowedOrigins = csv(env.ALLOWED_ORIGINS);
+    const cors = corsHeaders(origin, allowedOrigins);
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, '') || '/';
 
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
-    if (allowed.length && !allowed.includes(origin)) return json({ error: 'Origin not allowed' }, 403, cors);
-
-    // --- /api/v2/...: relay for OAuth-token API calls -------------------------
-    if (path.startsWith('/api/v2/')) return relay(request, url, cors);
-
-    if (request.method !== 'POST') return json({ error: 'Use POST' }, 405, cors);
-    let body;
-    try { body = await request.json(); } catch { return json({ error: 'Body must be JSON' }, 400, cors); }
-    const listId = readListId(body);
-
-    // --- /verify: explain the state of an existing token -------------------
-    if (path === '/verify') {
-      const token = typeof body?.token === 'string' ? body.token.trim() : '';
-      if (!/^[A-Za-z0-9_\-.]{4,512}$/.test(token)) return json({ ok: false, error: 'Missing or invalid token' }, 400, cors);
-      return json(await verifyToken(token, listId, origin), 200, cors);
+    if (allowedOrigins.length && origin && !allowedOrigins.includes(origin)) {
+      return json({ err: 'Origin not allowed' }, 403, cors);
     }
 
-    // --- / or /exchange: code -> token ---------------------------------------
-    if (path !== '/' && path !== '/exchange') return json({ error: 'Not found' }, 404, cors);
-    if (!env.CLICKUP_CLIENT_ID || !env.CLICKUP_CLIENT_SECRET) {
-      return json({ error: 'Worker is missing CLICKUP_CLIENT_ID / CLICKUP_CLIENT_SECRET' }, 500, cors);
+    if (path === '/status') {
+      return json({
+        ok: true,
+        lists: csv(env.ALLOWED_LIST_IDS),
+        clickup: !!env.CLICKUP_TOKEN,
+        storage: !!env.DB,
+      }, 200, cors);
     }
-    const code = typeof body?.code === 'string' ? body.code.trim() : '';
-    if (!/^[A-Za-z0-9_\-.]{4,512}$/.test(code)) return json({ error: 'Missing or invalid code' }, 400, cors);
-
-    let upstream;
-    try {
-      upstream = await fetch(TOKEN_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ client_id: env.CLICKUP_CLIENT_ID, client_secret: env.CLICKUP_CLIENT_SECRET, code }),
-      });
-    } catch {
-      return json({ error: 'Could not reach ClickUp' }, 502, cors);
-    }
-    let data = null;
-    try { data = await upstream.json(); } catch { data = null; }
-    if (!upstream.ok || !data?.access_token) {
-      const message = data?.err || data?.error || `ClickUp answered HTTP ${upstream.status}`;
-      return json({ error: message, ecode: data?.ECODE }, upstream.ok ? 502 : upstream.status, cors);
-    }
-
-    const v = await verifyToken(data.access_token, listId, origin);
-    if (!v.ok) return json({ error: 'ClickUp issued a token but then rejected it: ' + v.error }, 502, cors);
-    return json({ access_token: data.access_token, ...v }, 200, cors);
+    if (path.startsWith('/api/v2/')) return relay(request, url, cors, env);
+    if (path === '/plan' || path.startsWith('/plan/')) return handlePlan(request, url, cors, env);
+    return json({ err: 'Not found' }, 404, cors);
   },
 };

@@ -1,15 +1,23 @@
-# Cloudflare Worker that exchanges ClickUp OAuth codes for access tokens.
+# Cloudflare Worker behind the planner page: read-only ClickUp relay + plan storage.
 # Deploy from this folder:
 #   npx wrangler login
-#   npx wrangler secret put CLICKUP_CLIENT_SECRET      # paste the app's client secret
-#   npx wrangler deploy                                 # prints the https://….workers.dev URL
+#   npx wrangler d1 execute humam-promotieplanner-plan --remote --file=schema.sql   # once
+#   npx wrangler secret put CLICKUP_TOKEN        # paste a personal ClickUp API token (pk_…)
+#   npx wrangler deploy                          # prints the https://….workers.dev URL
 name = "humam-promotieplanner-auth"
 main = "worker.js"
 compatibility_date = "2025-01-01"
 
 [vars]
-CLICKUP_CLIENT_ID = "277AWTMT2UOVUFVED8DPY21W4HT4JQR5"
+# ClickUp list ids the relay may read (comma-separated).
+ALLOWED_LIST_IDS = "901523821635"
 # Page origins allowed to call this worker (no trailing slash, comma-separated).
 ALLOWED_ORIGINS = "https://easyseebv.github.io,http://localhost:8765,http://127.0.0.1:8765"
 
-# CLICKUP_CLIENT_SECRET is NOT set here on purpose: it is a secret, see above.
+# The weekly plan is stored here (see schema.sql).
+[[d1_databases]]
+binding = "DB"
+database_name = "humam-promotieplanner-plan"
+database_id = "3ffa2376-12c4-4fc5-bdff-ca45cdb2b67a"
+
+# CLICKUP_TOKEN is a secret and is NOT set here on purpose (see above).

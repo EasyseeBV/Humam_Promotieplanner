@@ -1,94 +1,72 @@
 # Humam Promotieplanner
 
-A single-page website (GitHub Pages) that turns the ClickUp list
-**Promotions** into a weekly hour planner:
+A small website (GitHub Pages) that turns the ClickUp list **Promotions** into
+a weekly hour planner. Nobody has to log in.
 
 - Shows every task in the list (with subtasks) with **time spent**, **time
-  estimate** and what is **left**, straight from ClickUp.
+  estimate** and what is **left**, live from ClickUp.
 - Lets you **plan hours per workday** (Mon–Wed by default) by dragging a task
   onto a day or pressing *Plan*.
 - Checks that at least **7 of the 7.5 hours** of every workday are planned.
   Days before today are never checked; it is only about the plan going forward.
-- Refreshes itself from ClickUp every minute (and on demand).
+- Refreshes itself every minute (and on demand).
+- The plan lives **only on this site** (in the worker's database), never in
+  ClickUp. ClickUp is read, never written.
 
-No build step, no server: the page calls the ClickUp API directly from the
-browser with the visitor's own API token. The plan itself is stored in a
-ClickUp **text custom field** on each task, so everybody who opens the page
-sees the same plan and it is visible inside ClickUp too.
+## How it works
+
+```
+browser (GitHub Pages)  ──►  Cloudflare Worker (worker/)  ──►  ClickUp API (read-only, one token)
+                                     │
+                                     └──►  D1 database: the weekly plan
+```
+
+The page is static HTML/JS. The worker holds a single ClickUp API token as a
+secret and only relays two read-only calls for the allowed list (list details
+and its tasks). The weekly plan is stored per task in a D1 (SQLite) table and
+served to every visitor.
 
 ## One-time setup
 
-1. **Create the planning field in ClickUp** (once, by a workspace admin):
-   open the list, click **+** at the end of the column headers → **Text** →
-   name it `Planning`. Without this field the page works read-only.
-2. **Enable GitHub Pages**: repository *Settings → Pages → Build and
-   deployment → Source: Deploy from a branch → `main` / `(root)`* → Save.
-   The site appears at <https://easyseebv.github.io/Humam_Promotieplanner/>
-   after a minute. On a free organisation plan GitHub Pages only works for
-   **public** repositories; this repo contains no secrets, so it can be made
-   public safely.
-3. **Everyone who uses the page** signs in once, either with **Log in with
-   ClickUp** (see below) or with their personal ClickUp API token (ClickUp →
-   avatar → *Settings* → *Apps* → *API Token*). The token is kept in that
-   browser's `localStorage` only and is never committed.
-
-## "Log in with ClickUp" (optional, OAuth)
-
-A ClickUp OAuth app (`humamscheduler`) lets people sign in with one click
-instead of pasting a token. ClickUp's OAuth flow needs the app's **client
-secret** to turn the login code into a token, and a secret can never live in
-a public static site. The `worker/` folder therefore contains a ~60-line
-Cloudflare Worker (free plan is plenty) that does only that exchange.
-
-1. In ClickUp → *Settings* → *Integrations* → *ClickUp API* → your app, add
-   the **Redirect URL** `https://easyseebv.github.io/Humam_Promotieplanner/`
-   (exactly, with the trailing slash).
-2. Deploy the worker once (needs a free Cloudflare account and Node):
+1. **Worker** (free Cloudflare account, Node installed):
    ```
    cd worker
    npx wrangler login
-   npx wrangler secret put CLICKUP_CLIENT_SECRET   # paste the app's client secret
-   npx wrangler deploy                             # prints https://humam-promotieplanner-auth.<account>.workers.dev
+   npx wrangler d1 create humam-promotieplanner-plan       # copy the database_id into wrangler.toml
+   npx wrangler d1 execute humam-promotieplanner-plan --remote --file=schema.sql
+   npx wrangler secret put CLICKUP_TOKEN                   # paste a personal ClickUp API token (pk_…)
+   npx wrangler deploy                                     # prints the https://….workers.dev URL
    ```
-3. Put that URL in `DEFAULT_SETTINGS.oauthExchangeUrl` in `app.js` and push.
-   The sign-in screen then shows **Log in with ClickUp**; the personal-token
-   form stays available underneath.
+   The token is the "permission": everything the page shows is read with it,
+   so use a token of someone who can see the list. Only the two list calls are
+   relayed; the token can do nothing else through the worker.
+2. **Page**: put the worker URL in `DEFAULT_SETTINGS.workerUrl` in `app.js`
+   (already done for this deployment) and enable GitHub Pages: repository
+   *Settings → Pages → Deploy from a branch → `main` / `(root)`*. On a free
+   organisation plan Pages needs a **public** repository; there are no secrets
+   in it. The site then lives at
+   <https://easyseebv.github.io/Humam_Promotieplanner/>.
 
-The client id is public and already in `app.js` / `worker/wrangler.toml`; the
-secret only ever lives in the worker's encrypted secrets. If the Worker URL is
-left empty, the page simply offers the token login only.
-
-Two ClickUp quirks the worker also works around: ClickUp answers 401/403
-without CORS headers (the browser then only sees a "network error"), and it
-sends no CORS headers at all for OAuth tokens. The worker therefore verifies
-each new token server-side (`/verify`) and relays API calls made with an OAuth
-token (`/api/v2/...`), adding CORS headers. Personal tokens still call ClickUp
-directly.
+Anyone who knows the page URL can view and change the plan. Nothing in ClickUp
+can be changed through it.
 
 ## Configuration
 
-Defaults live at the top of `app.js` (`DEFAULT_SETTINGS`) and can be
-overridden per browser via the **Settings** button:
+Defaults live at the top of `app.js` (`DEFAULT_SETTINGS`) and can be overridden
+per browser via the **Settings** button:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| List ID | `901523821635` | ClickUp list to plan (from the URL `…/v/l/6-<LIST_ID>-1`). |
-| Planning custom field name | `Planning` | Text custom field that stores the plan per task. |
+| ClickUp list ID | `901523821635` | List to plan (from the URL `…/v/l/6-<LIST_ID>-1`); must be in the worker's `ALLOWED_LIST_IDS`. |
+| Worker URL | the deployed worker | Where the page reads ClickUp data and stores the plan. |
 | Workdays | Mon, Tue, Wed | Days that appear in the week view. |
 | Hours rule applies | per workday | `per workday`: each day needs its minimum. `per week`: the week total is checked. |
 | Capacity | 7.5 h | Hours available per workday (or per week). |
 | Minimum to plan | 7 h | Hours that must be planned per workday (or per week). |
-| Auto refresh | 60 s | How often the page reloads from ClickUp. |
+| Auto refresh | 60 s | How often the page reloads. |
 
-## How the plan is stored
-
-Each task's `Planning` field holds a readable list of `date: hours`, e.g.
-
-```
-2026-09-08: 2.5h, 2026-09-09: 4h
-```
-
-Entries older than 8 weeks are pruned whenever a task's plan is saved.
+Worker settings are in `worker/wrangler.toml` (`ALLOWED_LIST_IDS`,
+`ALLOWED_ORIGINS`, the D1 binding) plus the `CLICKUP_TOKEN` secret.
 
 ## Development
 
@@ -96,12 +74,12 @@ Entries older than 8 weeks are pruned whenever a task's plan is saved.
 node --test        # unit tests: planner-core.js and worker/worker.js
 ```
 
-Open `index.html` directly in a browser or serve the folder with any static
-server (`python -m http.server`). Files:
+Serve the folder with any static server on port 8765 (that origin is allowed
+by the worker), e.g. `python -m http.server 8765`. Files:
 
 - `index.html` – page shell and settings dialog
 - `styles.css` – styling (light/dark)
-- `planner-core.js` – pure logic: dates, ISO weeks, plan text format, checks
-- `app.js` – ClickUp API calls, OAuth sign-in, state and rendering
+- `planner-core.js` – pure logic: dates, ISO weeks, planning maps, checks
+- `app.js` – worker calls, state and rendering
 - `test/core.test.js` – tests for `planner-core.js`
-- `worker/` – Cloudflare Worker for the OAuth code→token exchange (+ tests)
+- `worker/` – Cloudflare Worker (read-only ClickUp relay + plan storage), schema and tests

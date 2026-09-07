@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ClickUp Planner</title>
-  <meta name="description" content="Weekly hour planning for a ClickUp list: see time spent and estimates per task, plan hours per workday.">
+  <title>Humam Promotieplanner</title>
+  <meta name="description" content="Weekly hour planning for the ClickUp list Promotions: time spent and estimates per task, plan hours per workday.">
   <meta name="color-scheme" content="light dark">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%237b68ee'/%3E%3Cpath d='M8 19l8-7 8 7' stroke='white' stroke-width='3.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="styles.css">
@@ -40,20 +40,12 @@
       </fieldset>
 
       <fieldset>
-        <legend>ClickUp</legend>
-        <label class="field"><span>List ID</span><input name="listId" type="text" pattern="\d+" required>
-          <small class="muted">From the list URL: <code>…/v/l/6-<strong>901523821635</strong>-1</code></small></label>
-        <label class="field"><span>Planning custom field name</span><input name="planningFieldName" type="text" required>
-          <small class="muted">A <em>Text</em> custom field on the list; the plan is saved there per task.</small></label>
+        <legend>Connection</legend>
+        <label class="field"><span>ClickUp list ID</span><input name="listId" type="text" pattern="\d+" required>
+          <small class="muted">From the list URL: <code>…/v/l/6-<strong>901523821635</strong>-1</code>. The worker must allow this list.</small></label>
+        <label class="field"><span>Worker URL</span><input name="workerUrl" type="url" required>
+          <small class="muted">The Cloudflare Worker (<code>worker/</code>) that reads ClickUp and stores the plan.</small></label>
         <label class="field"><span>Auto refresh (seconds)</span><input name="refreshSeconds" type="number" min="15" step="5" required></label>
-      </fieldset>
-
-      <fieldset>
-        <legend>Sign-in with ClickUp (OAuth)</legend>
-        <label class="field"><span>OAuth client ID</span><input name="oauthClientId" type="text" autocomplete="off">
-          <small class="muted">From the ClickUp app (Settings → Integrations → ClickUp API → Create an App).</small></label>
-        <label class="field"><span>Token exchange URL</span><input name="oauthExchangeUrl" type="url" placeholder="https://….workers.dev" autocomplete="off">
-          <small class="muted">URL of the deployed <code>worker/</code> Cloudflare Worker that holds the client secret. Leave empty to offer personal-token login only.</small></label>
       </fieldset>
 
       <div class="dialog-actions">

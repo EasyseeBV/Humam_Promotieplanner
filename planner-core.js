@@ -66,6 +66,36 @@
     return days.map(function (wd) { return toISODate(addDays(monday, wd - 1)); });
   }
 
+  function startOfMonth(d) {
+    return new Date(d.getFullYear(), d.getMonth(), 1);
+  }
+
+  function addMonths(d, n) {
+    return new Date(d.getFullYear(), d.getMonth() + n, 1);
+  }
+
+  // The Monday-based weeks that make up a month: every week with at least one
+  // configured workday inside the month. Each week lists all its workdays and
+  // flags the ones that fall outside the month.
+  function monthWeeks(monthDate, workdays) {
+    var first = startOfMonth(monthDate);
+    var next = addMonths(first, 1);
+    var out = [];
+    var monday = startOfWeek(first);
+    var guard = 0;
+    while (monday < next && guard++ < 7) {
+      var days = weekDates(monday, workdays).map(function (iso) {
+        var d = parseISODate(iso);
+        return { date: iso, inMonth: d >= first && d < next };
+      });
+      if (days.some(function (x) { return x.inMonth; })) {
+        out.push({ monday: toISODate(monday), week: isoWeek(monday), days: days });
+      }
+      monday = addDays(monday, 7);
+    }
+    return out;
+  }
+
   // ---------------------------------------------------------- planning text --
   // The plan lives in a ClickUp text custom field per task, in a format that
   // is readable inside ClickUp itself:  "2026-09-08: 2.5h, 2026-09-09: 1h"
@@ -266,14 +296,61 @@
     };
   }
 
+  // Run weekSummary for every week of a month (see monthWeeks) and aggregate.
+  // Weeks entirely in the past do not count; a month is 'short' as soon as
+  // one remaining week is.
+  function monthSummary(opts) {
+    var weeks = (opts.weeks || []).map(function (w) {
+      var s = weekSummary({
+        dates: w.days.map(function (d) { return d.date; }),
+        todayISO: opts.todayISO,
+        plannedByDate: opts.plannedByDate,
+        settings: opts.settings
+      });
+      s.week = w.week;
+      s.monday = w.monday;
+      s.days.forEach(function (d, i) { d.inMonth = !!w.days[i].inMonth; });
+      return s;
+    });
+    var remaining = weeks.filter(function (w) { return w.state !== 'past'; });
+    var totals = { plannedTotal: 0, plannedRemaining: 0, required: 0, capacityRemaining: 0, shortDays: 0 };
+    weeks.forEach(function (w) {
+      totals.plannedTotal += w.plannedTotal;
+      totals.plannedRemaining += w.plannedRemaining;
+      totals.required += w.required;
+      totals.capacityRemaining += w.capacityRemaining;
+      totals.shortDays += w.days.filter(function (d) { return d.state === 'short'; }).length;
+    });
+    var state;
+    if (remaining.length === 0) state = 'past';
+    else if (remaining.some(function (w) { return w.state === 'short'; })) state = 'short';
+    else if (remaining.some(function (w) { return w.state === 'over'; })) state = 'over';
+    else state = 'ok';
+    return {
+      weeks: weeks,
+      state: state,
+      remainingWeeks: remaining.length,
+      plannedTotal: roundHours(totals.plannedTotal),
+      plannedRemaining: roundHours(totals.plannedRemaining),
+      required: roundHours(totals.required),
+      capacityRemaining: roundHours(totals.capacityRemaining),
+      missing: roundHours(Math.max(0, totals.required - totals.plannedRemaining)),
+      shortDays: totals.shortDays
+    };
+  }
+
   return {
     MS_PER_HOUR: MS_PER_HOUR,
     toISODate: toISODate,
     parseISODate: parseISODate,
     addDays: addDays,
     startOfWeek: startOfWeek,
+    startOfMonth: startOfMonth,
+    addMonths: addMonths,
     isoWeek: isoWeek,
     weekDates: weekDates,
+    monthWeeks: monthWeeks,
+    monthSummary: monthSummary,
     parsePlanning: parsePlanning,
     formatPlanning: formatPlanning,
     prunePlanning: prunePlanning,

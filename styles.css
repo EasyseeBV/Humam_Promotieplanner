@@ -117,8 +117,9 @@ h2 { font-size: 16px; }
   margin: 0 auto;
 }
 @media (min-width: 1280px) {
-  .layout { grid-template-columns: minmax(520px, 5fr) minmax(0, 6fr); align-items: start; }
-  .week-panel { position: sticky; top: 74px; }
+  .layout { grid-template-columns: minmax(560px, 6fr) minmax(0, 5fr); align-items: start; }
+  /* With more than four workdays the month grid needs the full width. */
+  .layout.stacked { grid-template-columns: minmax(0, 1fr); }
 }
 
 .card {
@@ -170,7 +171,6 @@ h2 { font-size: 16px; }
 .state-past .meter-fill { background: var(--past); }
 .meter-mark { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--text); opacity: .6; }
 
-.days { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
 .day {
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -327,3 +327,23 @@ dialog::backdrop { background: rgba(10, 10, 20, .45); }
 .or-divider { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
 .or-divider::before, .or-divider::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
 .token-form { display: flex; flex-direction: column; gap: 10px; }
+
+/* ----------------------------------------------------------------- month view */
+.month-grid { display: grid; grid-template-columns: 92px repeat(var(--cols, 3), minmax(0, 1fr)); gap: 8px; align-items: stretch; }
+.month-head { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; padding: 0 4px 2px; }
+.week-cell { border: 1px solid var(--border); border-radius: 10px; padding: 8px; background: var(--past-bg); display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.week-cell.state-ok { background: var(--ok-bg); }
+.week-cell.state-short { background: var(--short-bg); }
+.week-cell.state-over { background: var(--over-bg); }
+.week-cell .badge { align-self: flex-start; }
+.month-grid .day { min-height: 112px; padding: 8px; font-size: 12.5px; }
+.month-grid .day-name { font-size: 12.5px; }
+.month-grid .plan-items { gap: 4px; }
+.month-grid .plan-item { padding: 5px 7px; font-size: 12px; }
+.month-grid .empty { padding: 4px; font-size: 11.5px; }
+.month-grid .plan-form { padding: 8px; }
+.month-grid .plan-form-row label { flex-direction: row; align-items: center; gap: 8px; color: var(--text); }
+.month-grid .plan-form-row input { width: 76px; }
+.day.other-month { opacity: .7; }
+.plan-item[draggable="true"] { cursor: grab; }
+.plan-item.dragging { opacity: .5; }

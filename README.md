@@ -5,10 +5,12 @@ a weekly hour planner. Nobody has to log in.
 
 - Shows every task in the list (with subtasks) with **time spent**, **time
   estimate** and what is **left**, live from ClickUp.
-- Lets you **plan hours per workday** (Mon–Wed by default) by dragging a task
-  onto a day or pressing *Plan*.
-- Checks that at least **7 of the 7.5 hours** of every workday are planned.
-  Days before today are never checked; it is only about the plan going forward.
+- Shows a **whole month** at a time: one row per week, one column per workday
+  (Mon–Wed by default). Drag a task onto a day or press *Plan* to plan hours;
+  click a planned block to change or remove it, drag it to move it.
+- Checks that at least **7 of the 7.5 hours** of every workday are planned,
+  per day and per week. Days before today are never checked; it is only about
+  the plan going forward.
 - Refreshes itself every minute (and on demand).
 - The plan lives **only on this site** (in the worker's database), never in
   ClickUp. ClickUp is read, never written.

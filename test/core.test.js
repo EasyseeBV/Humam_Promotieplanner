@@ -32,6 +32,44 @@ test('weekDates lists the configured workdays of that week in order', () => {
   assert.deepEqual(C.weekDates(monday, []), []);
 });
 
+test('monthWeeks lists the Mon-based weeks touching the month, flagging days outside it', () => {
+  const weeks = C.monthWeeks(new Date(2026, 8, 15), [1, 2, 3]); // September 2026
+  assert.deepEqual(weeks.map(w => w.week.week), [36, 37, 38, 39, 40]);
+  assert.equal(weeks[0].monday, '2026-08-31');
+  assert.deepEqual(weeks[0].days, [
+    { date: '2026-08-31', inMonth: false },
+    { date: '2026-09-01', inMonth: true },
+    { date: '2026-09-02', inMonth: true },
+  ]);
+  assert.deepEqual(weeks[4].days.map(d => d.date), ['2026-09-28', '2026-09-29', '2026-09-30']);
+  // A week whose configured workdays all fall outside the month is skipped:
+  const onlyWed = C.monthWeeks(new Date(2026, 9, 1), [3]); // October 2026, Wednesdays only
+  assert.deepEqual(onlyWed.map(w => w.days[0].date), ['2026-10-07', '2026-10-14', '2026-10-21', '2026-10-28']);
+  assert.equal(C.toISODate(C.startOfMonth(new Date(2026, 8, 15))), '2026-09-01');
+  assert.equal(C.toISODate(C.addMonths(new Date(2026, 11, 15), 1)), '2027-01-01');
+});
+
+test('monthSummary aggregates the week checks and ignores weeks that are over', () => {
+  const weeks = C.monthWeeks(new Date(2026, 8, 1), [1, 2, 3]);
+  const settings = { normScope: 'day', hoursPerUnit: 7.5, minHoursPerUnit: 7 };
+  // Today is Tue 15 Sep: week 36 and 37 are in the past, week 38 partly.
+  const s = C.monthSummary({
+    weeks, todayISO: '2026-09-15', settings,
+    plannedByDate: { '2026-09-15': 7, '2026-09-16': 7, '2026-09-21': 7, '2026-09-22': 7, '2026-09-23': 7.5, '2026-09-28': 7, '2026-09-29': 7, '2026-09-30': 6 },
+  });
+  assert.deepEqual(s.weeks.map(w => w.state), ['past', 'past', 'ok', 'ok', 'short']);
+  assert.equal(s.state, 'short');
+  assert.equal(s.remainingWeeks, 3);
+  assert.equal(s.shortDays, 1);
+  assert.equal(s.required, 7 * 8);          // 8 remaining workdays
+  assert.equal(s.capacityRemaining, 7.5 * 8);
+  assert.equal(s.plannedRemaining, 55.5);
+  assert.equal(s.missing, 0.5);
+  assert.equal(s.weeks[0].days[0].inMonth, false); // 31 Aug carried through
+  const done = C.monthSummary({ weeks, todayISO: '2026-10-05', settings, plannedByDate: {} });
+  assert.equal(done.state, 'past');
+});
+
 test('parsePlanning reads the text format, tolerates commas/spaces, ignores junk', () => {
   assert.deepEqual(C.parsePlanning('2026-09-08: 2.5h, 2026-09-09: 1h'), { '2026-09-08': 2.5, '2026-09-09': 1 });
   assert.deepEqual(C.parsePlanning('2026-09-08=1,5 ; 2026-09-09 : 0.25'), { '2026-09-08': 1.5, '2026-09-09': 0.25 });

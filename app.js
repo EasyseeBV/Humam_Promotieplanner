@@ -12,6 +12,7 @@
   var C = window.PlannerCore;
   var API = 'https://api.clickup.com/api/v2';
   var LS_TOKEN = 'clickupPlanner.token';
+  var LS_TOKEN_SCHEME = 'clickupPlanner.tokenScheme'; // 'bearer' | 'plain', for OAuth tokens
   var LS_SETTINGS = 'clickupPlanner.settings';
   var LS_COLLAPSED = 'clickupPlanner.collapsed';
 
@@ -41,6 +42,8 @@
 
   var state = {
     token: localStorage.getItem(LS_TOKEN) || '',
+    tokenScheme: localStorage.getItem(LS_TOKEN_SCHEME) || 'bearer',
+    retryAfterVerify: false,
     user: null,
     settings: loadSettings(),
     listName: '',
@@ -99,7 +102,7 @@
 
   function api(path, opts) {
     opts = opts || {};
-    var headers = { Authorization: C.authHeader(state.token) };
+    var headers = { Authorization: C.authHeader(state.token, state.tokenScheme) };
     if (opts.body) headers['Content-Type'] = 'application/json';
     return fetch(API + path, {
       method: opts.method || 'GET',
@@ -118,7 +121,10 @@
         return json;
       });
     }, function () {
-      throw new ApiError('Could not reach the ClickUp API (network error or offline).', 0);
+      // ClickUp sends no CORS headers on 401/403, so a rejected token also
+      // ends up here: the browser cannot read the response at all.
+      throw new ApiError('ClickUp did not answer this request (the browser could not read the response). ' +
+        'Usually the token was rejected or has no access to this list; it can also mean you are offline.', 0);
     });
   }
 
@@ -192,13 +198,60 @@
       if (e && e.status === 401) {
         signOut();
         state.error = e.message;
-      } else {
-        state.error = (e && e.message) || String(e);
+        return;
       }
+      state.error = (e && e.message) || String(e);
+      if (e && e.status === 0) return explainFailure();
     }).then(function () {
       state.loading = false;
+      var again = state.retryAfterVerify;
+      state.retryAfterVerify = false;
       render();
+      if (again) return refresh();
     });
+  }
+
+  // The browser cannot read ClickUp's 401/403 responses (no CORS headers), so
+  // for OAuth tokens we ask the worker what ClickUp actually thinks of it.
+  function explainFailure() {
+    if (!state.token || /^pk_/i.test(state.token) || !state.settings.oauthExchangeUrl) return Promise.resolve();
+    return verifyWithWorker(state.token).then(function (v) {
+      if (!v) return;
+      if (!v.ok) {
+        signOut();
+        state.error = 'Your ClickUp login is no longer valid (' + v.error + '). Please log in again.';
+        return;
+      }
+      if (v.scheme && v.scheme !== state.tokenScheme) {
+        // ClickUp wants the other Authorization form for this token: switch and retry once.
+        state.tokenScheme = v.scheme;
+        localStorage.setItem(LS_TOKEN_SCHEME, v.scheme);
+        state.error = null;
+        state.retryAfterVerify = true;
+        return;
+      }
+      if (v.user && v.user.username) state.user = v.user.username;
+      if (v.list && v.list.ok === false) state.error = noListAccessMessage(v);
+      else state.error = 'ClickUp accepts the login, but this request still failed. ' + state.error;
+    }).catch(function () { /* keep the generic message */ });
+  }
+
+  function verifyWithWorker(token) {
+    var url = String(state.settings.oauthExchangeUrl).replace(/\/+$/, '') + '/verify';
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: token, list_id: String(state.settings.listId) })
+    }).then(function (res) { return res.json(); });
+  }
+
+  function noListAccessMessage(v) {
+    var who = v.user && v.user.username ? 'Logged in as ' + v.user.username + ', but this' : 'This';
+    var teams = (v.teams || []).map(function (t) { return t.name; }).join(', ');
+    return who + ' ClickUp login has no access to list ' + (v.list && v.list.id ? v.list.id : state.settings.listId) +
+      ' (' + ((v.list && v.list.error) || 'not authorized') + '). ' +
+      (teams ? 'Authorized workspaces: ' + teams + '. ' : 'No workspaces were authorized. ') +
+      'Sign out, log in with ClickUp again and tick the workspace that contains the list.';
   }
 
   function savePlanning(task, newMap) {
@@ -254,7 +307,9 @@
     state.lastUpdated = null;
     state.editing = null;
     state.estimateEditing = null;
+    state.tokenScheme = 'bearer';
     localStorage.removeItem(LS_TOKEN);
+    localStorage.removeItem(LS_TOKEN_SCHEME);
   }
 
   // ------------------------------------------------------------------ oauth --
@@ -303,7 +358,11 @@
     return fetch(state.settings.oauthExchangeUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code: cb.code, redirect_uri: C.oauthRedirectUri(location.origin, location.pathname) })
+      body: JSON.stringify({
+        code: cb.code,
+        redirect_uri: C.oauthRedirectUri(location.origin, location.pathname),
+        list_id: String(state.settings.listId)
+      })
     }).then(function (res) {
       return res.text().then(function (text) {
         var json = null;
@@ -311,14 +370,23 @@
         if (!res.ok || !json || !json.access_token) {
           throw new Error((json && json.error) || ('token exchange failed, HTTP ' + res.status));
         }
-        return json.access_token;
+        return json;
       });
     }, function () {
       throw new Error('could not reach the token exchange service');
-    }).then(function (token) {
-      state.token = token;
-      localStorage.setItem(LS_TOKEN, token);
+    }).then(function (result) {
+      state.token = result.access_token;
+      state.tokenScheme = result.scheme === 'plain' ? 'plain' : 'bearer';
+      localStorage.setItem(LS_TOKEN, state.token);
+      localStorage.setItem(LS_TOKEN_SCHEME, state.tokenScheme);
+      if (result.user && result.user.username) state.user = result.user.username;
       state.oauthBusy = false;
+      if (result.list && result.list.ok === false) {
+        // Token works, but not for this list: say so instead of failing later with an unreadable 401.
+        state.error = noListAccessMessage(result);
+        render();
+        return;
+      }
       render();
       scheduleAutoRefresh();
       return refresh();

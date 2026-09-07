@@ -68,6 +68,9 @@ test('authHeader: personal tokens as-is, OAuth tokens as Bearer', () => {
   assert.equal(C.authHeader('pk_123_ABC'), 'pk_123_ABC');
   assert.equal(C.authHeader('  pk_123  '), 'pk_123');
   assert.equal(C.authHeader('a1b2c3oauth'), 'Bearer a1b2c3oauth');
+  assert.equal(C.authHeader('a1b2c3oauth', 'bearer'), 'Bearer a1b2c3oauth');
+  assert.equal(C.authHeader('a1b2c3oauth', 'plain'), 'a1b2c3oauth');
+  assert.equal(C.authHeader('pk_1', 'bearer'), 'pk_1');
   assert.equal(C.authHeader(''), '');
   assert.equal(C.authHeader(null), '');
 });

@@ -121,13 +121,15 @@
   }
 
   // ------------------------------------------------------------------- auth --
-  // Personal API tokens (pk_...) are sent as-is; OAuth access tokens need the
-  // "Bearer" scheme (https://developer.clickup.com/docs/authentication).
+  // Personal API tokens (pk_...) are sent as-is. OAuth access tokens use the
+  // documented "Bearer" form unless the worker found that ClickUp only accepts
+  // the bare token for it (scheme === 'plain').
 
-  function authHeader(token) {
+  function authHeader(token, scheme) {
     var t = String(token || '').trim();
     if (!t) return '';
-    return /^pk_/i.test(t) ? t : 'Bearer ' + t;
+    if (/^pk_/i.test(t) || scheme === 'plain') return t;
+    return 'Bearer ' + t;
   }
 
   // Parse the query string ClickUp redirects back with after "Log in with

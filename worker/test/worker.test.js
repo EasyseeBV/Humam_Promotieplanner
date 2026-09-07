@@ -79,6 +79,7 @@ test('exchange: uses the secret, verifies the token and reports scheme, user, te
       scheme: 'bearer',
       user: { id: 7, username: 'Humam', email: 'h@x' },
       teams: [{ id: '90151742365', name: 'Easysee' }],
+      cors: { allowOrigin: null }, // the fake ClickUp sends no CORS header, like the real one for OAuth tokens
       list: { ok: true, id: '901523821635', name: 'Promotions' },
     });
     assert.equal(res.headers.get('Access-Control-Allow-Origin'), 'http://localhost:8765');
@@ -150,6 +151,48 @@ test('verify: explains an existing token (valid, and invalid)', async () => {
     const malformed = await worker.fetch(post({ token: 'x y' }, ORIGIN, '/verify'), ENV);
     assert.equal(malformed.status, 400);
   });
+});
+
+test('relay: forwards /api/v2 calls with the caller token and adds CORS headers, also on 401', async () => {
+  const cu = fakeClickUp();
+  await withFetch(cu.impl, async () => {
+    const ok = await worker.fetch(new Request('https://x/api/v2/list/901523821635?page=0&subtasks=true', {
+      headers: { Origin: ORIGIN, Authorization: 'Bearer good' },
+    }), ENV);
+    assert.equal(ok.status, 200);
+    assert.equal(ok.headers.get('Access-Control-Allow-Origin'), ORIGIN);
+    assert.equal((await ok.json()).name, 'Promotions');
+    const fwd = cu.calls[cu.calls.length - 1];
+    assert.equal(fwd.url, 'https://api.clickup.com/api/v2/list/901523821635?page=0&subtasks=true');
+    assert.equal(fwd.auth, 'Bearer good');
+
+    const bad = await worker.fetch(new Request('https://x/api/v2/user', { headers: { Origin: ORIGIN, Authorization: 'Bearer nope' } }), ENV);
+    assert.equal(bad.status, 401);
+    assert.equal(bad.headers.get('Access-Control-Allow-Origin'), ORIGIN); // readable by the browser now
+    assert.equal((await bad.json()).err, 'Oauth token not found');
+
+    const write = await worker.fetch(new Request('https://x/api/v2/task/abc/field/f1', {
+      method: 'POST', headers: { Origin: ORIGIN, Authorization: 'Bearer good', 'Content-Type': 'application/json' }, body: '{"value":"2026-09-08: 2h"}',
+    }), ENV);
+    assert.equal(write.status, 404); // fake ClickUp has no such route, but the call was forwarded intact:
+    const w = cu.calls[cu.calls.length - 1];
+    assert.equal(w.method, 'POST');
+    assert.deepEqual(w.body, { value: '2026-09-08: 2h' });
+
+    const noAuth = await worker.fetch(new Request('https://x/api/v2/user', { headers: { Origin: ORIGIN } }), ENV);
+    assert.equal(noAuth.status, 401);
+    const patch = await worker.fetch(new Request('https://x/api/v2/user', { method: 'PATCH', headers: { Origin: ORIGIN, Authorization: 'Bearer good' } }), ENV);
+    assert.equal(patch.status, 405);
+    const foreign = await worker.fetch(new Request('https://x/api/v2/user', { headers: { Origin: 'https://evil.example', Authorization: 'Bearer good' } }), ENV);
+    assert.equal(foreign.status, 403);
+  });
+});
+
+test('preflight allows the authorization header for relayed calls', async () => {
+  const res = await worker.fetch(new Request('https://x/api/v2/user', { method: 'OPTIONS', headers: { Origin: ORIGIN, 'Access-Control-Request-Headers': 'authorization' } }), ENV);
+  assert.equal(res.status, 204);
+  assert.match(res.headers.get('Access-Control-Allow-Headers'), /authorization/);
+  assert.match(res.headers.get('Access-Control-Allow-Methods'), /PUT/);
 });
 
 test('reports a misconfigured worker instead of calling ClickUp', async () => {

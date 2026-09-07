@@ -58,6 +58,13 @@ The client id is public and already in `app.js` / `worker/wrangler.toml`; the
 secret only ever lives in the worker's encrypted secrets. If the Worker URL is
 left empty, the page simply offers the token login only.
 
+Two ClickUp quirks the worker also works around: ClickUp answers 401/403
+without CORS headers (the browser then only sees a "network error"), and it
+sends no CORS headers at all for OAuth tokens. The worker therefore verifies
+each new token server-side (`/verify`) and relays API calls made with an OAuth
+token (`/api/v2/...`), adding CORS headers. Personal tokens still call ClickUp
+directly.
+
 ## Configuration
 
 Defaults live at the top of `app.js` (`DEFAULT_SETTINGS`) and can be

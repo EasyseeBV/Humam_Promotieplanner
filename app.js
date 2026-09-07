@@ -100,11 +100,19 @@
   }
   ApiError.prototype = Object.create(Error.prototype);
 
+  // Personal tokens talk to ClickUp directly (it sends CORS headers for them).
+  // OAuth tokens are relayed through the worker, because ClickUp omits CORS
+  // headers for those and the browser would refuse every response.
+  function apiBase() {
+    var direct = /^pk_/i.test(state.token) || !state.settings.oauthExchangeUrl;
+    return direct ? API : String(state.settings.oauthExchangeUrl).replace(/\/+$/, '') + '/api/v2';
+  }
+
   function api(path, opts) {
     opts = opts || {};
     var headers = { Authorization: C.authHeader(state.token, state.tokenScheme) };
     if (opts.body) headers['Content-Type'] = 'application/json';
-    return fetch(API + path, {
+    return fetch(apiBase() + path, {
       method: opts.method || 'GET',
       headers: headers,
       body: opts.body ? JSON.stringify(opts.body) : undefined,

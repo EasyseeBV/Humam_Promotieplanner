@@ -29,7 +29,7 @@
     // tiny Cloudflare Worker (see worker/). Leave the URL empty to offer
     // personal-token login only.
     oauthClientId: '277AWTMT2UOVUFVED8DPY21W4HT4JQR5',
-    oauthExchangeUrl: ''
+    oauthExchangeUrl: 'https://humam-promotieplanner-auth.humam-promotieplanner-auth.workers.dev'
   };
   var LS_OAUTH_STATE = 'clickupPlanner.oauthState';
 

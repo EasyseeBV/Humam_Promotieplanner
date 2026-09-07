@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ClickUp Planner</title>
+  <meta name="description" content="Weekly hour planning for a ClickUp list: see time spent and estimates per task, plan hours per workday.">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%237b68ee'/%3E%3Cpath d='M8 19l8-7 8 7' stroke='white' stroke-width='3.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app"></div>
+
+  <dialog id="settings-dialog">
+    <form method="dialog" data-form="settings" class="settings-form">
+      <h2>Settings</h2>
+      <p class="muted small">Stored in this browser only.</p>
+
+      <fieldset>
+        <legend>Schedule</legend>
+        <div class="workdays">
+          <label><input type="checkbox" name="workdays" value="1"> Mon</label>
+          <label><input type="checkbox" name="workdays" value="2"> Tue</label>
+          <label><input type="checkbox" name="workdays" value="3"> Wed</label>
+          <label><input type="checkbox" name="workdays" value="4"> Thu</label>
+          <label><input type="checkbox" name="workdays" value="5"> Fri</label>
+          <label><input type="checkbox" name="workdays" value="6"> Sat</label>
+          <label><input type="checkbox" name="workdays" value="7"> Sun</label>
+        </div>
+        <div class="radio-row">
+          <span>Hours rule applies</span>
+          <label><input type="radio" name="normScope" value="day"> per workday</label>
+          <label><input type="radio" name="normScope" value="week"> per week</label>
+        </div>
+        <div class="two-col">
+          <label class="field"><span>Capacity (hours)</span><input name="hoursPerUnit" type="number" step="0.25" min="0.25" required></label>
+          <label class="field"><span>Minimum to plan (hours)</span><input name="minHoursPerUnit" type="number" step="0.25" min="0" required></label>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>ClickUp</legend>
+        <label class="field"><span>List ID</span><input name="listId" type="text" pattern="\d+" required>
+          <small class="muted">From the list URL: <code>…/v/l/6-<strong>901523821635</strong>-1</code></small></label>
+        <label class="field"><span>Planning custom field name</span><input name="planningFieldName" type="text" required>
+          <small class="muted">A <em>Text</em> custom field on the list; the plan is saved there per task.</small></label>
+        <label class="field"><span>Auto refresh (seconds)</span><input name="refreshSeconds" type="number" min="15" step="5" required></label>
+      </fieldset>
+
+      <div class="dialog-actions">
+        <button type="button" class="btn" data-action="close-settings">Cancel</button>
+        <button type="submit" class="btn primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="planner-core.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

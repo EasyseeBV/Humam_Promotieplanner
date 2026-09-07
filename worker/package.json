@@ -1,0 +1,11 @@
+{
+  "name": "humam-promotieplanner-auth",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker: ClickUp OAuth code -> access token exchange for the planner page",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test"
+  }
+}

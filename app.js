@@ -23,8 +23,15 @@
     hoursPerUnit: 7.5,             // capacity per day (or per week)
     minHoursPerUnit: 7,            // must be planned per day (or per week)
     refreshSeconds: 60,            // auto refresh interval
-    keepWeeks: 8                   // planning older than this is pruned on save
+    keepWeeks: 8,                  // planning older than this is pruned on save
+    // "Log in with ClickUp" (OAuth). The client id is public. Exchanging the
+    // login code for a token needs the client secret, so that step runs in a
+    // tiny Cloudflare Worker (see worker/). Leave the URL empty to offer
+    // personal-token login only.
+    oauthClientId: '277AWTMT2UOVUFVED8DPY21W4HT4JQR5',
+    oauthExchangeUrl: ''
   };
+  var LS_OAUTH_STATE = 'clickupPlanner.oauthState';
 
   var DAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   var DAY_LONG = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -50,7 +57,8 @@
     showDone: false,
     collapsed: loadCollapsed(),
     saving: {},
-    dragTaskId: null
+    dragTaskId: null,
+    oauthBusy: false        // true while the ClickUp login code is being exchanged
   };
 
   var refreshTimer = null;
@@ -61,7 +69,8 @@
     try { s = JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}') || {}; } catch (e) { s = {}; }
     var out = {};
     Object.keys(DEFAULT_SETTINGS).forEach(function (k) {
-      out[k] = s[k] !== undefined && s[k] !== null && s[k] !== '' ? s[k] : DEFAULT_SETTINGS[k];
+      out[k] = s[k] !== undefined && s[k] !== null ? s[k] : DEFAULT_SETTINGS[k];
+      if (out[k] === '' && DEFAULT_SETTINGS[k] !== '') out[k] = DEFAULT_SETTINGS[k];
     });
     if (!Array.isArray(out.workdays) || !out.workdays.length) out.workdays = DEFAULT_SETTINGS.workdays.slice();
     return out;
@@ -90,7 +99,7 @@
 
   function api(path, opts) {
     opts = opts || {};
-    var headers = { Authorization: state.token };
+    var headers = { Authorization: C.authHeader(state.token) };
     if (opts.body) headers['Content-Type'] = 'application/json';
     return fetch(API + path, {
       method: opts.method || 'GET',
@@ -248,6 +257,78 @@
     localStorage.removeItem(LS_TOKEN);
   }
 
+  // ------------------------------------------------------------------ oauth --
+  // Flow: startOAuth() sends the browser to ClickUp; ClickUp redirects back to
+  // this page with ?code=…&state=…; finishOAuth() posts the code to the
+  // exchange URL (Cloudflare Worker holding the client secret) and stores the
+  // returned access token exactly like a personal token.
+
+  function randomState() {
+    var arr = new Uint8Array(16);
+    window.crypto.getRandomValues(arr);
+    return Array.prototype.map.call(arr, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+  }
+
+  function oauthConfigured() {
+    return !!(state.settings.oauthClientId && state.settings.oauthExchangeUrl);
+  }
+
+  function startOAuth() {
+    if (!oauthConfigured()) { toast('ClickUp login is not configured (see Settings).', 'error'); return; }
+    var st = randomState();
+    try { sessionStorage.setItem(LS_OAUTH_STATE, st); } catch (e) { /* ignore */ }
+    var redirect = C.oauthRedirectUri(location.origin, location.pathname);
+    location.href = 'https://app.clickup.com/api?client_id=' + encodeURIComponent(state.settings.oauthClientId) +
+      '&redirect_uri=' + encodeURIComponent(redirect) + '&state=' + encodeURIComponent(st);
+  }
+
+  function finishOAuth(cb) {
+    var expected = '';
+    try { expected = sessionStorage.getItem(LS_OAUTH_STATE) || ''; sessionStorage.removeItem(LS_OAUTH_STATE); } catch (e) { /* ignore */ }
+    // Drop ?code=… from the address bar right away so a reload does not retry a used code.
+    try { history.replaceState(null, '', location.pathname + location.hash); } catch (e) { /* ignore */ }
+    if (!state.settings.oauthExchangeUrl) {
+      state.error = 'Received a ClickUp login code, but no token exchange URL is configured.';
+      render();
+      return Promise.resolve();
+    }
+    if (expected && cb.state !== expected) {
+      state.error = 'ClickUp login could not be verified (state mismatch). Please try again.';
+      render();
+      return Promise.resolve();
+    }
+    state.oauthBusy = true;
+    state.error = null;
+    render();
+    return fetch(state.settings.oauthExchangeUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: cb.code, redirect_uri: C.oauthRedirectUri(location.origin, location.pathname) })
+    }).then(function (res) {
+      return res.text().then(function (text) {
+        var json = null;
+        try { json = JSON.parse(text); } catch (e) { json = null; }
+        if (!res.ok || !json || !json.access_token) {
+          throw new Error((json && json.error) || ('token exchange failed, HTTP ' + res.status));
+        }
+        return json.access_token;
+      });
+    }, function () {
+      throw new Error('could not reach the token exchange service');
+    }).then(function (token) {
+      state.token = token;
+      localStorage.setItem(LS_TOKEN, token);
+      state.oauthBusy = false;
+      render();
+      scheduleAutoRefresh();
+      return refresh();
+    }).catch(function (e) {
+      state.oauthBusy = false;
+      state.error = 'ClickUp login failed: ' + (e && e.message ? e.message : e);
+      render();
+    });
+  }
+
   // -------------------------------------------------------------- helpers --
 
   function esc(s) {
@@ -345,7 +426,7 @@
 
   function render() {
     var root = document.getElementById('app');
-    if (!state.token) {
+    if (!state.token || state.oauthBusy) {
       root.innerHTML = renderTokenScreen();
       document.title = 'ClickUp Planner';
       return;
@@ -373,24 +454,33 @@
   }
 
   function renderTokenScreen() {
+    if (state.oauthBusy) {
+      return '' +
+        '<div class="token-screen"><div class="card token-card">' +
+        '  <h1>ClickUp Planner</h1>' +
+        '  <p><span class="icon spin">&#x21bb;</span> Signing in with ClickUp…</p>' +
+        '</div></div>';
+    }
+    var oauth = oauthConfigured();
     return '' +
       '<div class="token-screen">' +
-      '  <form class="card token-card" data-form="token">' +
+      '  <div class="card token-card">' +
       '    <h1>ClickUp Planner</h1>' +
       '    <p>This page reads tasks straight from ClickUp and stores the weekly plan in a ' +
-      '       ClickUp custom field. Sign in with your <strong>personal ClickUp API token</strong>; ' +
-      '       it is kept only in this browser.</p>' +
-      '    <ol class="steps">' +
-      '      <li>In ClickUp click your avatar → <em>Settings</em> → <em>Apps</em>.</li>' +
-      '      <li>Under <em>API Token</em> click <em>Generate</em> (or <em>Copy</em>).</li>' +
-      '      <li>Paste it below.</li>' +
-      '    </ol>' +
+      '       ClickUp custom field. Your login is kept in this browser only.</p>' +
       (state.error ? '<div class="banner error">' + esc(state.error) + '</div>' : '') +
-      '    <label class="field"><span>API token</span>' +
-      '      <input name="token" type="password" autocomplete="off" placeholder="pk_…" required></label>' +
-      '    <button type="submit" class="btn primary">Sign in</button>' +
-      '    <p class="muted small">Open <a href="https://app.clickup.com/settings/apps" target="_blank" rel="noopener">app.clickup.com/settings/apps</a> to get a token.</p>' +
-      '  </form>' +
+      (oauth
+        ? '<button type="button" class="btn primary block" data-action="oauth-login">Log in with ClickUp</button>' +
+          '<div class="or-divider"><span>or use a personal API token</span></div>'
+        : '') +
+      '    <form class="token-form" data-form="token">' +
+      '      <label class="field"><span>Personal API token</span>' +
+      '        <input name="token" type="password" autocomplete="off" placeholder="pk_…" required></label>' +
+      '      <button type="submit" class="btn' + (oauth ? '' : ' primary') + '">Sign in with token</button>' +
+      '    </form>' +
+      '    <p class="muted small">Get a token in ClickUp: avatar → <em>Settings</em> → <em>Apps</em> → <em>API Token</em> ' +
+      '       (<a href="https://app.clickup.com/settings/apps" target="_blank" rel="noopener">app.clickup.com/settings/apps</a>).</p>' +
+      '  </div>' +
       '</div>';
   }
 
@@ -675,6 +765,8 @@
     f.hoursPerUnit.value = s.hoursPerUnit;
     f.minHoursPerUnit.value = s.minHoursPerUnit;
     f.refreshSeconds.value = s.refreshSeconds;
+    f.oauthClientId.value = s.oauthClientId || '';
+    f.oauthExchangeUrl.value = s.oauthExchangeUrl || '';
     dlg.showModal();
   }
 
@@ -693,7 +785,9 @@
       hoursPerUnit: hours,
       minHoursPerUnit: min,
       refreshSeconds: Math.max(15, Number(form.refreshSeconds.value) || DEFAULT_SETTINGS.refreshSeconds),
-      keepWeeks: state.settings.keepWeeks
+      keepWeeks: state.settings.keepWeeks,
+      oauthClientId: form.oauthClientId.value.trim() || DEFAULT_SETTINGS.oauthClientId,
+      oauthExchangeUrl: form.oauthExchangeUrl.value.trim()
     };
     saveSettings();
     if (listChanged) { state.listName = ''; state.tasks = []; }
@@ -756,6 +850,7 @@
       case 'refresh': refresh(); break;
       case 'open-settings': openSettings(); break;
       case 'sign-out': signOut(); state.error = null; render(); break;
+      case 'oauth-login': startOAuth(); break;
       case 'prev-week': state.weekMonday = C.addDays(state.weekMonday, -7); state.editing = null; render(); break;
       case 'next-week': state.weekMonday = C.addDays(state.weekMonday, 7); state.editing = null; render(); break;
       case 'this-week': state.weekMonday = C.startOfWeek(new Date()); state.editing = null; render(); break;
@@ -915,6 +1010,10 @@
     dlg.addEventListener('click', function (ev) {
       if (ev.target.getAttribute('data-action') === 'close-settings') dlg.close();
     });
+
+    // Coming back from "Log in with ClickUp"? Exchange the code first.
+    var cb = C.parseOAuthCallback(location.search);
+    if (cb) { finishOAuth(cb); return; }
 
     render();
     if (state.token) {

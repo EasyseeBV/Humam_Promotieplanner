@@ -64,6 +64,27 @@ test('hour conversions', () => {
   assert.equal(C.formatHours(null), '—');
 });
 
+test('authHeader: personal tokens as-is, OAuth tokens as Bearer', () => {
+  assert.equal(C.authHeader('pk_123_ABC'), 'pk_123_ABC');
+  assert.equal(C.authHeader('  pk_123  '), 'pk_123');
+  assert.equal(C.authHeader('a1b2c3oauth'), 'Bearer a1b2c3oauth');
+  assert.equal(C.authHeader(''), '');
+  assert.equal(C.authHeader(null), '');
+});
+
+test('parseOAuthCallback reads code and state from the redirect query', () => {
+  assert.deepEqual(C.parseOAuthCallback('?code=ABC123&state=xyz'), { code: 'ABC123', state: 'xyz' });
+  assert.deepEqual(C.parseOAuthCallback('code=ABC%2B1'), { code: 'ABC+1', state: '' });
+  assert.equal(C.parseOAuthCallback('?state=only'), null);
+  assert.equal(C.parseOAuthCallback(''), null);
+});
+
+test('oauthRedirectUri drops a trailing index.html so it matches the registered URL', () => {
+  assert.equal(C.oauthRedirectUri('https://easyseebv.github.io', '/Humam_Promotieplanner/'), 'https://easyseebv.github.io/Humam_Promotieplanner/');
+  assert.equal(C.oauthRedirectUri('https://easyseebv.github.io', '/Humam_Promotieplanner/index.html'), 'https://easyseebv.github.io/Humam_Promotieplanner/');
+  assert.equal(C.oauthRedirectUri('http://localhost:8765', '/index.html'), 'http://localhost:8765/');
+});
+
 test('buildTaskTree nests subtasks, sorts by orderindex and rolls up hours', () => {
   const tasks = [
     { id: 'p', parent: null, orderindex: '2', name: 'Parent', spentHours: 1, estimateHours: 0 },

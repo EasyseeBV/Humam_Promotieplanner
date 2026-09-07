@@ -48,6 +48,14 @@
         <label class="field"><span>Auto refresh (seconds)</span><input name="refreshSeconds" type="number" min="15" step="5" required></label>
       </fieldset>
 
+      <fieldset>
+        <legend>Sign-in with ClickUp (OAuth)</legend>
+        <label class="field"><span>OAuth client ID</span><input name="oauthClientId" type="text" autocomplete="off">
+          <small class="muted">From the ClickUp app (Settings → Integrations → ClickUp API → Create an App).</small></label>
+        <label class="field"><span>Token exchange URL</span><input name="oauthExchangeUrl" type="url" placeholder="https://….workers.dev" autocomplete="off">
+          <small class="muted">URL of the deployed <code>worker/</code> Cloudflare Worker that holds the client secret. Leave empty to offer personal-token login only.</small></label>
+      </fieldset>
+
       <div class="dialog-actions">
         <button type="button" class="btn" data-action="close-settings">Cancel</button>
         <button type="submit" class="btn primary">Save</button>

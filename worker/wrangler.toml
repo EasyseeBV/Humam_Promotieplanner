@@ -1,0 +1,15 @@
+# Cloudflare Worker that exchanges ClickUp OAuth codes for access tokens.
+# Deploy from this folder:
+#   npx wrangler login
+#   npx wrangler secret put CLICKUP_CLIENT_SECRET      # paste the app's client secret
+#   npx wrangler deploy                                 # prints the https://….workers.dev URL
+name = "humam-promotieplanner-auth"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[vars]
+CLICKUP_CLIENT_ID = "277AWTMT2UOVUFVED8DPY21W4HT4JQR5"
+# Page origins allowed to call this worker (no trailing slash, comma-separated).
+ALLOWED_ORIGINS = "https://easyseebv.github.io,http://localhost:8765,http://127.0.0.1:8765"
+
+# CLICKUP_CLIENT_SECRET is NOT set here on purpose: it is a secret, see above.

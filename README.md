@@ -27,9 +27,36 @@ sees the same plan and it is visible inside ClickUp too.
    after a minute. On a free organisation plan GitHub Pages only works for
    **public** repositories; this repo contains no secrets, so it can be made
    public safely.
-3. **Everyone who uses the page** signs in once with their personal ClickUp API
-   token (ClickUp → avatar → *Settings* → *Apps* → *API Token*). The token is
-   kept in that browser's `localStorage` only and is never committed.
+3. **Everyone who uses the page** signs in once, either with **Log in with
+   ClickUp** (see below) or with their personal ClickUp API token (ClickUp →
+   avatar → *Settings* → *Apps* → *API Token*). The token is kept in that
+   browser's `localStorage` only and is never committed.
+
+## "Log in with ClickUp" (optional, OAuth)
+
+A ClickUp OAuth app (`humamscheduler`) lets people sign in with one click
+instead of pasting a token. ClickUp's OAuth flow needs the app's **client
+secret** to turn the login code into a token, and a secret can never live in
+a public static site. The `worker/` folder therefore contains a ~60-line
+Cloudflare Worker (free plan is plenty) that does only that exchange.
+
+1. In ClickUp → *Settings* → *Integrations* → *ClickUp API* → your app, add
+   the **Redirect URL** `https://easyseebv.github.io/Humam_Promotieplanner/`
+   (exactly, with the trailing slash).
+2. Deploy the worker once (needs a free Cloudflare account and Node):
+   ```
+   cd worker
+   npx wrangler login
+   npx wrangler secret put CLICKUP_CLIENT_SECRET   # paste the app's client secret
+   npx wrangler deploy                             # prints https://humam-promotieplanner-auth.<account>.workers.dev
+   ```
+3. Put that URL in `DEFAULT_SETTINGS.oauthExchangeUrl` in `app.js` and push.
+   The sign-in screen then shows **Log in with ClickUp**; the personal-token
+   form stays available underneath.
+
+The client id is public and already in `app.js` / `worker/wrangler.toml`; the
+secret only ever lives in the worker's encrypted secrets. If the Worker URL is
+left empty, the page simply offers the token login only.
 
 ## Configuration
 
@@ -59,7 +86,7 @@ Entries older than 8 weeks are pruned whenever a task's plan is saved.
 ## Development
 
 ```
-node --test        # unit tests for the date/planning logic (planner-core.js)
+node --test        # unit tests: planner-core.js and worker/worker.js
 ```
 
 Open `index.html` directly in a browser or serve the folder with any static
@@ -68,5 +95,6 @@ server (`python -m http.server`). Files:
 - `index.html` – page shell and settings dialog
 - `styles.css` – styling (light/dark)
 - `planner-core.js` – pure logic: dates, ISO weeks, plan text format, checks
-- `app.js` – ClickUp API calls, state and rendering
+- `app.js` – ClickUp API calls, OAuth sign-in, state and rendering
 - `test/core.test.js` – tests for `planner-core.js`
+- `worker/` – Cloudflare Worker for the OAuth code→token exchange (+ tests)
